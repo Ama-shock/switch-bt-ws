@@ -21,10 +21,18 @@ FROM rust:1.77-slim-bookworm AS builder
 # ---------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc-mingw-w64-x86-64 \
-        g++-mingw-w64-x86-64 \
+        mingw-w64-x86-64-dev \
         git \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Linux のケースセンシティブなファイルシステムへの対応。
+# BTStack は Windows 慣例の大文字ヘッダー名でインクルードするが、
+# mingw-w64 のヘッダーはすべて小文字で格納されているためシンボリックリンクを作成する。
+RUN cd /usr/x86_64-w64-mingw32/include && \
+    ln -sf windows.h  Windows.h  && \
+    ln -sf winusb.h   Winusb.h   && \
+    ln -sf setupapi.h SetupAPI.h
 
 # Windows クロスコンパイル用ターゲットを追加
 RUN rustup target add x86_64-pc-windows-gnu
@@ -33,7 +41,10 @@ RUN rustup target add x86_64-pc-windows-gnu
 # BTStack ソースの取得
 # ---------------------------------------------------------------------------
 WORKDIR /btstack
-RUN git clone --depth=1 https://github.com/mizuyoukanao/btstack.git windows
+# コミットを固定してビルドの再現性を確保する
+ARG BTSTACK_COMMIT=a843d07e2
+RUN git clone https://github.com/mizuyoukanao/btstack.git windows && \
+    git -C windows checkout ${BTSTACK_COMMIT}
 
 # ---------------------------------------------------------------------------
 # アプリケーションソースのコピー

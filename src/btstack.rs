@@ -42,10 +42,12 @@ extern "C" {
     fn send_stick_l(stick_horizontal: u32, stick_vertical: u32, press_time: u32);
 
     /// ジャイロセンサー値を設定する。
-    fn send_gyro(gyro1: i16, gyro2: i16, gyro3: i16);
+    #[link_name = "send_gyro"]
+    fn ffi_send_gyro(gyro1: i16, gyro2: i16, gyro3: i16);
 
     /// 加速度センサー値を設定する。
-    fn send_accel(accel_x: i16, accel_y: i16, accel_z: i16);
+    #[link_name = "send_accel"]
+    fn ffi_send_accel(accel_x: i16, accel_y: i16, accel_z: i16);
 
     /// コントローラーカラーを設定する（各値は 0x00RRGGBB）。
     fn send_padcolor(
@@ -59,10 +61,12 @@ extern "C" {
     fn get_rumble() -> bool;
 
     /// 振動中に押し続けるボタンのビットマスクを登録する。
-    fn rumble_register(key: u32);
+    #[link_name = "rumble_register"]
+    fn ffi_rumble_register(key: u32);
 
     /// 指定ファイルパスの Amiibo データを送信する（NUL 終端 C 文字列）。
-    fn send_amiibo(path: *const std::os::raw::c_char);
+    #[link_name = "send_amiibo"]
+    fn ffi_send_amiibo(path: *const std::os::raw::c_char);
 
     /// VID/PID+インスタンス番号でターゲット USB ドングルを指定する。
     /// apply_patches.sh によって hci_transport_h2_winusb.c に追加された関数。
@@ -115,12 +119,12 @@ pub fn set_stick_l(h: u32, v: u32) {
 
 /// ジャイロセンサー値を更新する。
 pub fn send_gyro(g1: i16, g2: i16, g3: i16) {
-    unsafe { send_gyro(g1, g2, g3) }
+    unsafe { ffi_send_gyro(g1, g2, g3) }
 }
 
 /// 加速度センサー値を更新する。
 pub fn send_accel(x: i16, y: i16, z: i16) {
-    unsafe { send_accel(x, y, z) }
+    unsafe { ffi_send_accel(x, y, z) }
 }
 
 /// コントローラー本体・ボタン・グリップの色を変更する（各値 0x00RRGGBB）。
@@ -135,13 +139,13 @@ pub fn get_rumble_state() -> bool {
 
 /// 振動イベント時に押下するボタンのビットマスクを登録する。
 pub fn rumble_register(key: u32) {
-    unsafe { rumble_register(key) }
+    unsafe { ffi_rumble_register(key) }
 }
 
 /// Amiibo の `.bin` ダンプファイルを読み込んで送信する。
 pub fn send_amiibo(path: &str) {
     match CString::new(path) {
-        Ok(cstr) => unsafe { send_amiibo(cstr.as_ptr()) },
+        Ok(cstr) => unsafe { ffi_send_amiibo(cstr.as_ptr()) },
         Err(_) => tracing::warn!("send_amiibo: パスに NUL バイトが含まれています: {path:?}"),
     }
 }
