@@ -3,11 +3,11 @@
 //! Windows の場合 :  BTStack 全ソース + btkeyLib + btstack_platform.c をコンパイル
 //! 非 Windows の場合: スタブをコンパイルしてクレートを開発・CI 環境でもビルド可能にする
 //!
-//! 期待するディレクトリ構成（このファイルからの相対パス）:
-//!   ../windows/             — mizuyoukanao/btstack フォーク
-//!                             （port/windows-winusb、example/、src/ 等を含む）
-//!   csrc/btstack_platform.c — main() シンボルを排除した Windows プラットフォーム初期化
-//!   csrc/btstack_stub.c     — 非 Windows ビルド用の空スタブ
+//! BTStack ルートの解決順序（Windows ビルド時）:
+//!   1. 環境変数 BTSTACK_ROOT が設定されていればそれを使用
+//!      （Docker コンテナ内では /btstack/windows を指定）
+//!   2. 未設定の場合は ../windows にフォールバック
+//!      （ローカル開発環境向け）
 
 use std::path::{Path, PathBuf};
 
@@ -28,12 +28,21 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn compile_btstack() {
-    let btstack_root = PathBuf::from("../windows");
+    // BTSTACK_ROOT 環境変数 → フォールバック ../windows
+    let btstack_root = if let Ok(root) = std::env::var("BTSTACK_ROOT") {
+        PathBuf::from(root)
+    } else {
+        PathBuf::from("../windows")
+    };
+
+    println!("cargo:rerun-if-env-changed=BTSTACK_ROOT");
 
     if !btstack_root.exists() {
         panic!(
             "BTStack ルートが見つかりません: {:?}\n\
-             Cargo.toml から見て ../windows に mizuyoukanao/btstack のクローンが必要です。",
+             環境変数 BTSTACK_ROOT を設定するか、Cargo.toml から見て ../windows に \
+             mizuyoukanao/btstack のクローンが必要です。\n\
+             Docker でビルドする場合は Dockerfile を使用してください。",
             btstack_root.canonicalize().unwrap_or(btstack_root)
         );
     }
@@ -146,8 +155,6 @@ fn compile_btstack() {
     // -----------------------------------------------------------------------
     println!("cargo:rerun-if-changed=csrc/btstack_platform.c");
     println!("cargo:rerun-if-changed=csrc/btstack_stub.c");
-    println!("cargo:rerun-if-changed=../windows/example/btkeyLib.c");
-    println!("cargo:rerun-if-changed=../windows/port/windows-winusb/btstack_config.h");
 }
 
 fn add_c_file(build: &mut cc::Build, path: &Path) {

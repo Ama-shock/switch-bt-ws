@@ -21,3 +21,4 @@ void  send_padcolor(unsigned int a, unsigned int b,
 bool  get_rumble(void)                                                  { return false; }
 void  rumble_register(unsigned int key)                                { (void)key; }
 void  send_amiibo(const char *path)                                    { (void)path; }
+void  hci_transport_usb_set_target(unsigned short vid, unsigned short pid, int instance) { (void)vid; (void)pid; (void)instance; }

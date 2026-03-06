@@ -33,6 +33,8 @@ pub struct BtUsbDevice {
     pub description: String,
     /// 現在適用中のドライバ（例: "WinUSB"、"BthUsb"、"Unknown"）
     pub driver: String,
+    /// 同一 VID/PID デバイスが複数ある場合のインスタンス番号（0 始まり）
+    pub instance: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,16 +107,22 @@ Get-WmiObject Win32_PnPEntity |
 
         let entries: Vec<PnpEntry> = serde_json::from_str(&json_str).unwrap_or_default();
 
+        // 同一 VID/PID のデバイスにインスタンス番号を付与するためカウンターを管理
+        let mut instance_counters: std::collections::HashMap<(String, String), u32> = std::collections::HashMap::new();
+
         let mut devices = Vec::new();
         for entry in entries {
             let device_id = entry.device_id.unwrap_or_default();
             // "USB\VID_0A12&PID_0001\..." 形式から VID/PID を抽出
             let (vid, pid) = parse_vid_pid(&device_id);
+            let key = (vid.clone(), pid.clone());
+            let instance = *instance_counters.entry(key).and_modify(|c| *c += 1).or_insert(0);
             devices.push(BtUsbDevice {
                 vid,
                 pid,
                 description: entry.description.unwrap_or_else(|| "不明".into()),
                 driver:      entry.service.unwrap_or_else(|| "不明".into()),
+                instance,
             });
         }
         Ok(devices)

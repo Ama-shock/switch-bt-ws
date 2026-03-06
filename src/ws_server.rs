@@ -1,67 +1,81 @@
 //! WebSocket ハンドラ。
 //!
 //! 接続したブラウザごとに `handle_socket` タスクを生成し、以下を行います：
-//!   - クライアントから受信した `ClientMessage` JSON フレームを
-//!     BTStack への直接 FFI 呼び出しに変換する。
-//!   - ステータスタスクからの `ServerMessage` ブロードキャストを受け取り、
-//!     JSON テキストフレームとしてクライアントへ転送する。
+//!   - URL パスの `:id` からコントローラーを特定して `ControllerHandle` を取得
+//!   - クライアントから受信した `ClientMessage` JSON フレームを `WorkerCommand` に変換して
+//!     ワーカーサブプロセスの stdin に転送する
+//!   - ワーカーの stdout ブロードキャストを受け取り、`ServerMessage` JSON として
+//!     クライアントへ送信する
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::Response;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::sync::broadcast;
 
-use crate::{btstack, gamepad, protocol::{ClientMessage, ServerMessage}};
-
-pub type StatusTx = Arc<broadcast::Sender<ServerMessage>>;
+use crate::api::AppState;
+use crate::controller::ControllerHandle;
+use crate::gamepad;
+use crate::ipc::{WorkerCommand, WorkerEvent};
+use crate::protocol::{ClientMessage, ServerMessage};
 
 /// axum ルートハンドラ — HTTP リクエストを WebSocket 接続にアップグレードする。
+/// URL: `/ws/:id` の `:id` でコントローラーを指定する。
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(status_tx): State<StatusTx>,
+    Path(id): Path<u32>,
+    State(state): State<AppState>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, status_tx))
+    match state.controllers.get(id).await {
+        Some(handle) => ws.on_upgrade(move |socket| handle_socket(socket, handle)),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("コントローラー id={id} が見つかりません"),
+        )
+            .into_response(),
+    }
 }
 
-async fn handle_socket(socket: WebSocket, status_tx: StatusTx) {
-    tracing::info!("WebSocket クライアント接続");
+async fn handle_socket(socket: WebSocket, handle: Arc<ControllerHandle>) {
+    tracing::info!("WebSocket クライアント接続 (controller id={})", handle.id());
 
-    let mut status_rx = status_tx.subscribe();
+    let mut event_rx = handle.subscribe_status();
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     loop {
         tokio::select! {
             // ----------------------------------------------------------------
-            // サーバー → クライアント: ステータスブロードキャスト
+            // ワーカー → クライアント: WorkerEvent をブロードキャストから受け取る
             // ----------------------------------------------------------------
-            result = status_rx.recv() => {
+            result = event_rx.recv() => {
                 match result {
-                    Ok(msg) => {
-                        match serde_json::to_string(&msg) {
-                            Ok(json) => {
-                                if ws_tx.send(Message::Text(json)).await.is_err() {
-                                    break; // クライアント切断
+                    Ok(event) => {
+                        if let Some(msg) = worker_event_to_server_msg(event) {
+                            match serde_json::to_string(&msg) {
+                                Ok(json) => {
+                                    if ws_tx.send(Message::Text(json)).await.is_err() {
+                                        break;
+                                    }
                                 }
+                                Err(e) => tracing::error!("JSON シリアライズエラー: {e}"),
                             }
-                            Err(e) => tracing::error!("JSON シリアライズエラー: {e}"),
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("ステータスブロードキャストが {n} メッセージ遅延");
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("イベントブロードキャストが {n} メッセージ遅延");
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
 
             // ----------------------------------------------------------------
-            // クライアント → サーバー: ゲームパッド入力
+            // クライアント → ワーカー: ゲームパッド入力
             // ----------------------------------------------------------------
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_client_message(&text, &mut ws_tx).await;
+                        dispatch_client_message(&text, &handle, &mut ws_tx).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         tracing::info!("WebSocket クライアント切断");
@@ -78,8 +92,21 @@ async fn handle_socket(socket: WebSocket, status_tx: StatusTx) {
     }
 }
 
-async fn handle_client_message<S>(text: &str, ws_tx: &mut S)
-where
+fn worker_event_to_server_msg(event: WorkerEvent) -> Option<ServerMessage> {
+    match event {
+        WorkerEvent::Status { paired, rumble } => Some(ServerMessage::Status { paired, rumble }),
+        WorkerEvent::Error { message } => Some(ServerMessage::Error { message }),
+        _ => None,
+    }
+}
+
+/// クライアントの JSON メッセージを WorkerCommand に変換してワーカーへ送る。
+/// 1 つのクライアントメッセージが複数の WorkerCommand を生成することがある（GamepadState など）。
+async fn dispatch_client_message<S>(
+    text: &str,
+    handle: &Arc<ControllerHandle>,
+    ws_tx: &mut S,
+) where
     S: SinkExt<Message> + Unpin,
     S::Error: std::fmt::Debug,
 {
@@ -98,52 +125,33 @@ where
     };
 
     match msg {
-        // --------------------------------------------------------------------
-        // メインの入力パス（ブラウザが毎アニメーションフレームに呼び出す）
-        // --------------------------------------------------------------------
         ClientMessage::GamepadState { buttons, axes } => {
             let button_flags = gamepad::map_buttons(&buttons);
-            btstack::set_buttons(button_flags);
+            handle.send(WorkerCommand::Button { button_status: button_flags });
 
             let (lh, lv, rh, rv) = gamepad::map_axes(&axes);
-            btstack::set_stick_left(lh, lv);
-            btstack::set_stick_right(rh, rv);
+            handle.send(WorkerCommand::StickL { h: lh, v: lv });
+            handle.send(WorkerCommand::StickR { h: rh, v: rv });
         }
-
-        // --------------------------------------------------------------------
-        // モーションセンサー（Web DeviceMotion API）
-        // --------------------------------------------------------------------
         ClientMessage::Motion { gyro, accel } => {
             let g = |i: usize| gyro.get(i).copied().unwrap_or(0);
             let a = |i: usize| accel.get(i).copied().unwrap_or(100);
-            btstack::set_gyro(g(0), g(1), g(2));
-            btstack::set_accel(a(0), a(1), a(2));
+            handle.send(WorkerCommand::Gyro { g1: g(0), g2: g(1), g3: g(2) });
+            handle.send(WorkerCommand::Accel { x: a(0), y: a(1), z: a(2) });
         }
-
-        // --------------------------------------------------------------------
-        // コントローラー外観
-        // --------------------------------------------------------------------
-        ClientMessage::SetColor {
-            pad_color,
-            button_color,
-            left_grip_color,
-            right_grip_color,
-        } => {
-            btstack::set_padcolor(pad_color, button_color, left_grip_color, right_grip_color);
+        ClientMessage::SetColor { pad_color, button_color, left_grip_color, right_grip_color } => {
+            handle.send(WorkerCommand::PadColor {
+                pad: pad_color,
+                btn: button_color,
+                lg: left_grip_color,
+                rg: right_grip_color,
+            });
         }
-
-        // --------------------------------------------------------------------
-        // Amiibo
-        // --------------------------------------------------------------------
         ClientMessage::SendAmiibo { path } => {
-            btstack::send_amiibo_file(&path);
+            handle.send(WorkerCommand::Amiibo { path });
         }
-
-        // --------------------------------------------------------------------
-        // 振動応答設定
-        // --------------------------------------------------------------------
         ClientMessage::RumbleRegister { key } => {
-            btstack::set_rumble_response(key);
+            handle.send(WorkerCommand::RumbleRegister { key });
         }
     }
 }

@@ -1,82 +1,75 @@
 //! switch-bt-ws — エントリーポイント。
 //!
-//! 起動シーケンス：
-//!   1. BTStack スレッドを生成し、C の `start_gamepad()` を呼び出す（ブロッキング）。
-//!   2. ステータスブロードキャストタスクを起動する（100ms 間隔）。
-//!   3. axum HTTP + WebSocket サーバーを `127.0.0.1:8765` で開始する。
+//! ## 動作モード
+//!
+//! ### サーバーモード（引数なし）
+//! HTTP + WebSocket サーバーを起動する。
+//! ブラウザから WebSocket 経由でゲームパッド入力を受け付け、
+//! ドングルごとのワーカーサブプロセスに IPC で転送する。
+//!
+//! ### ワーカーモード（`--worker <id> <vid_hex> <pid_hex> <instance>`）
+//! BTStack を起動して Switch Pro Controller をエミュレートする。
+//! 親プロセス（サーバーモード）との通信は stdin/stdout の JSON 行（NDJSON）で行う。
+//! BTStack はグローバルな C 状態を持つため、ドングルごとに独立したプロセスとして動作する。
 
 mod api;
 mod btstack;
+mod controller;
 mod driver;
 mod gamepad;
+mod ipc;
 mod protocol;
+mod worker;
 mod ws_server;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
-use crate::protocol::ServerMessage;
+use crate::api::AppState;
+use crate::controller::ControllerManager;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // ロギング初期化。RUST_LOG 環境変数で制御（未設定時は info レベル）。
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // --worker フラグでワーカーモードに切り替える
+    if args.len() > 1 && args[1] == "--worker" {
+        // ワーカーモードは同期（Tokio ランタイム不要）
+        init_logging();
+        worker::run(&args);
+        return Ok(());
+    }
+
+    // サーバーモード
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_server())
+}
+
+fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+}
 
-    // -----------------------------------------------------------------------
-    // BTStack スレッド
-    //
-    // `btstack::start()` は C の `start_gamepad()` を呼び出し、
-    // WinUSB HCI トランスポートと Pro Controller エミュレーターを初期化した後、
-    // `btstack_run_loop_execute()` 内でシャットダウンまでブロックします。
-    // 専用の OS スレッドを使う必要があります。
-    // -----------------------------------------------------------------------
-    std::thread::Builder::new()
-        .name("btstack".into())
-        .spawn(|| {
-            tracing::info!("BTStack スレッド開始");
-            btstack::start();
-            tracing::info!("BTStack スレッド終了");
-        })?;
+async fn run_server() -> anyhow::Result<()> {
+    init_logging();
 
-    // BTStack が HCI を初期化するまで少し待つ
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let controllers = Arc::new(ControllerManager::new());
 
-    // -----------------------------------------------------------------------
-    // ブロードキャストチャンネル（サーバー → 全接続クライアント）
-    // 定期ステータスプッシュに使用する。
-    // -----------------------------------------------------------------------
-    let (status_tx, _) = broadcast::channel::<ServerMessage>(32);
-    let status_tx = Arc::new(status_tx);
+    let state = AppState {
+        controllers: Arc::clone(&controllers),
+    };
 
-    // バックグラウンドタスク: 接続中の全クライアントへ 100ms ごとにステータスを送信
-    let status_tx_clone = Arc::clone(&status_tx);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            let msg = ServerMessage::Status {
-                paired: btstack::is_paired(),
-                rumble: btstack::get_rumble_state(),
-            };
-            // クライアントが接続していない場合の send エラーは無視
-            let _ = status_tx_clone.send(msg);
-        }
-    });
-
-    // -----------------------------------------------------------------------
-    // HTTP + WebSocket サーバー（axum）
-    // -----------------------------------------------------------------------
     let addr: SocketAddr = "127.0.0.1:8765".parse()?;
-    let app = api::build_router(Arc::clone(&status_tx));
+    let app = api::build_router(state);
 
     tracing::info!("HTTP サーバー起動: http://{addr}");
-    tracing::info!("WebSocket エンドポイント: ws://{addr}/ws");
+    tracing::info!("WebSocket エンドポイント: ws://{addr}/ws/<controller_id>");
+    tracing::info!("コントローラー追加: POST http://{addr}/api/controllers {{\"vid\": 2578, \"pid\": 1}}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

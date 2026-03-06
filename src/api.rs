@@ -2,82 +2,146 @@
 //!
 //! ## エンドポイント一覧
 //!
-//! | メソッド | パス                    | 説明                         |
-//! |---------|------------------------|------------------------------|
-//! | GET     | `/ws`                  | WebSocket アップグレード       |
-//! | GET     | `/api/status`          | 接続・振動状態を返す           |
-//! | GET     | `/api/driver/list`     | BT USB デバイス一覧           |
-//! | POST    | `/api/driver/install`  | WinUSB ドライバを導入          |
-//! | POST    | `/api/driver/restore`  | 元の Bluetooth ドライバに戻す  |
+//! | メソッド | パス                       | 説明                                       |
+//! |---------|---------------------------|--------------------------------------------|
+//! | GET     | `/ws/:id`                 | WebSocket アップグレード（コントローラー指定）|
+//! | GET     | `/api/controllers`        | 全コントローラーの情報リスト                |
+//! | POST    | `/api/controllers`        | コントローラーを追加する                    |
+//! | DELETE  | `/api/controllers/:id`    | コントローラーを削除する                    |
+//! | GET     | `/api/driver/list`        | BT USB デバイス一覧                        |
+//! | POST    | `/api/driver/install`     | WinUSB ドライバを導入                      |
+//! | POST    | `/api/driver/restore`     | 元の Bluetooth ドライバに戻す              |
 
 use axum::{
-    extract::State,
-    routing::{get, post},
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::{btstack, driver, protocol::ServerMessage, ws_server};
+use crate::{controller::ControllerManager, driver, ws_server};
 
-pub type AppState = Arc<broadcast::Sender<ServerMessage>>;
+// ---------------------------------------------------------------------------
+// アプリケーション状態
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct AppState {
+    pub controllers: Arc<ControllerManager>,
+}
 
 /// axum ルーターを構築して返す。
-pub fn build_router(status_tx: AppState) -> Router {
-    // フロントエンドが別オリジンから接続できるよう CORS を許可
+pub fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
     Router::new()
-        // WebSocket
-        .route("/ws", get(ws_server::ws_handler))
-        // REST API
-        .route("/api/status",          get(api_status))
-        .route("/api/driver/list",     get(api_driver_list))
-        .route("/api/driver/install",  post(api_driver_install))
-        .route("/api/driver/restore",  post(api_driver_restore))
+        // WebSocket（コントローラー ID を URL パスから取得）
+        .route("/ws/:id", get(ws_server::ws_handler))
+        // コントローラー管理
+        .route("/api/controllers",     get(api_controllers_list).post(api_controllers_add))
+        .route("/api/controllers/:id", delete(api_controllers_remove))
+        // ドライバ管理
+        .route("/api/driver/list",    get(api_driver_list))
+        .route("/api/driver/install", post(api_driver_install))
+        .route("/api/driver/restore", post(api_driver_restore))
         .layer(cors)
-        .with_state(status_tx)
+        .with_state(state)
 }
 
 // ---------------------------------------------------------------------------
-// ハンドラ
+// コントローラー管理ハンドラ
 // ---------------------------------------------------------------------------
+
+async fn api_controllers_list(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::controller::ControllerInfo>> {
+    Json(state.controllers.list().await)
+}
+
+#[derive(Deserialize)]
+struct AddControllerRequest {
+    vid: u16,
+    pid: u16,
+    #[serde(default)]
+    instance: u32,
+}
 
 #[derive(Serialize)]
-struct StatusResponse {
-    /// Switch と接続中なら true
-    paired: bool,
-    /// Switch が振動を要求中なら true
-    rumble: bool,
+struct AddControllerResponse {
+    success: bool,
+    id: Option<u32>,
+    message: String,
 }
 
-async fn api_status(_: State<AppState>) -> Json<StatusResponse> {
-    Json(StatusResponse {
-        paired: btstack::is_paired(),
-        rumble: btstack::get_rumble_state(),
-    })
+async fn api_controllers_add(
+    State(state): State<AppState>,
+    Json(req): Json<AddControllerRequest>,
+) -> (StatusCode, Json<AddControllerResponse>) {
+    match state.controllers.add(req.vid, req.pid, req.instance).await {
+        Ok(id) => (
+            StatusCode::CREATED,
+            Json(AddControllerResponse {
+                success: true,
+                id: Some(id),
+                message: format!("コントローラー id={id} を追加しました"),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AddControllerResponse {
+                success: false,
+                id: None,
+                message: e.to_string(),
+            }),
+        ),
+    }
 }
 
-// ---- デバイス一覧 ----------------------------------------------------------
+#[derive(Serialize)]
+struct SimpleResponse {
+    success: bool,
+    message: String,
+}
+
+async fn api_controllers_remove(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> (StatusCode, Json<SimpleResponse>) {
+    match state.controllers.remove(id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(SimpleResponse {
+                success: true,
+                message: format!("コントローラー id={id} を削除しました"),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(SimpleResponse {
+                success: false,
+                message: e.to_string(),
+            }),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ドライバ管理ハンドラ
+// ---------------------------------------------------------------------------
 
 async fn api_driver_list(_: State<AppState>) -> Json<Vec<driver::BtUsbDevice>> {
-    let devices = driver::list_bt_usb_devices().await.unwrap_or_default();
-    Json(devices)
+    Json(driver::list_bt_usb_devices().await.unwrap_or_default())
 }
 
-// ---- ドライバ導入 / 復元 ---------------------------------------------------
-
-/// ドライバ操作リクエスト（VID / PID 指定）
 #[derive(Deserialize)]
 struct DriverRequest {
-    /// USB ベンダー ID（10進数）
     vid: u16,
-    /// USB プロダクト ID（10進数）
     pid: u16,
 }
 
@@ -87,7 +151,6 @@ struct DriverResponse {
     message: String,
 }
 
-/// WinUSB ドライバを導入する（管理者権限が必要）。
 async fn api_driver_install(
     _: State<AppState>,
     Json(req): Json<DriverRequest>,
@@ -98,7 +161,6 @@ async fn api_driver_install(
     }
 }
 
-/// 元の Bluetooth ドライバに戻す（管理者権限が必要）。
 async fn api_driver_restore(
     _: State<AppState>,
     Json(req): Json<DriverRequest>,
