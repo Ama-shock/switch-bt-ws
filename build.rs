@@ -1,12 +1,13 @@
-/// build.rs — Compiles BTStack C library and btkeyLib into a static library.
-///
-/// On Windows:  compiles the full BTStack + btkeyLib + btstack_platform.c
-/// On non-Windows: compiles a stub so the crate builds for development.
-///
-/// Expected layout (relative to this file):
-///   ../windows/  — the mizuyoukanao/btstack fork (port/windows-winusb, example/, src/, …)
-///   csrc/btstack_platform.c  — our modified main.c (no main() symbol)
-///   csrc/btstack_stub.c      — empty stubs for non-Windows builds
+//! build.rs — BTStack C ライブラリと btkeyLib を静的ライブラリとしてコンパイルする。
+//!
+//! Windows の場合 :  BTStack 全ソース + btkeyLib + btstack_platform.c をコンパイル
+//! 非 Windows の場合: スタブをコンパイルしてクレートを開発・CI 環境でもビルド可能にする
+//!
+//! 期待するディレクトリ構成（このファイルからの相対パス）:
+//!   ../windows/             — mizuyoukanao/btstack フォーク
+//!                             （port/windows-winusb、example/、src/ 等を含む）
+//!   csrc/btstack_platform.c — main() シンボルを排除した Windows プラットフォーム初期化
+//!   csrc/btstack_stub.c     — 非 Windows ビルド用の空スタブ
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,7 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     if target_os != "windows" {
-        println!("cargo:warning=BTStack integration is Windows-only; compiling stub.");
+        println!("cargo:warning=BTStack 統合は Windows 専用です。スタブをコンパイルします。");
         compile_stub();
         return;
     }
@@ -23,7 +24,7 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// Full BTStack build (Windows only)
+// BTStack フルビルド（Windows 専用）
 // ---------------------------------------------------------------------------
 
 fn compile_btstack() {
@@ -31,8 +32,8 @@ fn compile_btstack() {
 
     if !btstack_root.exists() {
         panic!(
-            "BTStack root not found at {:?}. \
-             Expected the mizuyoukanao/btstack clone at ../windows relative to Cargo.toml.",
+            "BTStack ルートが見つかりません: {:?}\n\
+             Cargo.toml から見て ../windows に mizuyoukanao/btstack のクローンが必要です。",
             btstack_root.canonicalize().unwrap_or(btstack_root)
         );
     }
@@ -40,18 +41,18 @@ fn compile_btstack() {
     let mut build = cc::Build::new();
 
     // -----------------------------------------------------------------------
-    // Include paths
+    // インクルードパス
     // -----------------------------------------------------------------------
     build
-        // BTStack core headers
+        // BTStack コアヘッダー
         .include(btstack_root.join("src"))
         .include(btstack_root.join("src/ble"))
         .include(btstack_root.join("src/classic"))
-        // Platform
+        // プラットフォーム
         .include(btstack_root.join("platform/windows"))
         .include(btstack_root.join("platform/posix"))
         .include(btstack_root.join("platform/embedded"))
-        // 3rd-party
+        // サードパーティ
         .include(btstack_root.join("3rd-party/bluedroid/decoder/include"))
         .include(btstack_root.join("3rd-party/bluedroid/encoder/include"))
         .include(btstack_root.join("3rd-party/micro-ecc"))
@@ -60,13 +61,13 @@ fn compile_btstack() {
         .include(btstack_root.join("3rd-party/hxcmod-player"))
         .include(btstack_root.join("3rd-party/rijndael"))
         .include(btstack_root.join("3rd-party/yxml"))
-        // Chipset
+        // チップセット
         .include(btstack_root.join("chipset/zephyr"))
-        // Port config (btstack_config.h lives here)
+        // btstack_config.h が格納されているポートディレクトリ
         .include(btstack_root.join("port/windows-winusb"));
 
     // -----------------------------------------------------------------------
-    // Source file globs
+    // ソースファイル（グロブパターン）
     // -----------------------------------------------------------------------
     let glob_patterns: &[&str] = &[
         "src/*.c",
@@ -88,11 +89,13 @@ fn compile_btstack() {
         "chipset/zephyr/*.c",
     ];
 
-    // Files to exclude (portaudio audio backend, conflicting memory impl, …)
+    // 不要なファイルを除外する
+    // - le_device_db_memory.c  : TLV 版を使うため不要
+    // - btstack_audio_portaudio.c : PortAudio 依存のため除外
+    // - sco_demo_util.c        : デモ用音声処理、btkeyLib には不要
     let exclude: &[&str] = &[
         "le_device_db_memory.c",
         "btstack_audio_portaudio.c",
-        // sco_demo_util pulls in audio deps we don't need
         "sco_demo_util.c",
     ];
 
@@ -100,19 +103,15 @@ fn compile_btstack() {
         let full = btstack_root.join(pattern);
         let pattern_str = full.to_string_lossy();
 
-        for entry in glob::glob(&pattern_str).expect("Bad glob pattern") {
+        for entry in glob::glob(&pattern_str).expect("グロブパターンエラー") {
             let path = match entry {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("cargo:warning=glob error: {e}");
+                    eprintln!("cargo:warning=グロブエラー: {e}");
                     continue;
                 }
             };
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !exclude.contains(&name) {
                 add_c_file(&mut build, &path);
             }
@@ -120,29 +119,30 @@ fn compile_btstack() {
     }
 
     // -----------------------------------------------------------------------
-    // Application-specific C files
+    // アプリケーション固有の C ファイル
     // -----------------------------------------------------------------------
 
-    // The Pro Controller emulator (the heart of the project)
+    // Pro Controller エミュレーション本体
     add_c_file(&mut build, &btstack_root.join("example/btkeyLib.c"));
 
-    // Our platform wrapper — replaces port/windows-winusb/main.c so that
-    // there is no competing main() symbol when linking with Rust.
+    // プラットフォームラッパー
+    // port/windows-winusb/main.c の改変版。
+    // main() を btstack_platform_run() にリネームして Rust の main() との衝突を回避。
     add_c_file(&mut build, Path::new("csrc/btstack_platform.c"));
 
     // -----------------------------------------------------------------------
-    // Compile
+    // コンパイル実行
     // -----------------------------------------------------------------------
     build.compile("btstack_gamepad");
 
     // -----------------------------------------------------------------------
-    // Linker flags — Windows-specific libraries required by BTStack WinUSB
+    // リンカーフラグ（BTStack WinUSB が必要とする Windows 標準ライブラリ）
     // -----------------------------------------------------------------------
     println!("cargo:rustc-link-lib=winusb");
     println!("cargo:rustc-link-lib=setupapi");
 
     // -----------------------------------------------------------------------
-    // Re-run triggers
+    // 変更検知トリガー
     // -----------------------------------------------------------------------
     println!("cargo:rerun-if-changed=csrc/btstack_platform.c");
     println!("cargo:rerun-if-changed=csrc/btstack_stub.c");
@@ -156,7 +156,7 @@ fn add_c_file(build: &mut cc::Build, path: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// Stub build (non-Windows — lets the crate compile for IDE / CI)
+// スタブビルド（非 Windows — IDE / CI 用）
 // ---------------------------------------------------------------------------
 
 fn compile_stub() {

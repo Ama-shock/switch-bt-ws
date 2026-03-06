@@ -1,10 +1,10 @@
-//! WebSocket handler.
+//! WebSocket ハンドラ。
 //!
-//! Each connected browser gets a `handle_socket` task that:
-//!   - Receives `ClientMessage` JSON frames and translates them into
-//!     direct FFI calls into BTStack.
-//!   - Receives `ServerMessage` broadcasts from the status task and
-//!     forwards them to the client as JSON text frames.
+//! 接続したブラウザごとに `handle_socket` タスクを生成し、以下を行います：
+//!   - クライアントから受信した `ClientMessage` JSON フレームを
+//!     BTStack への直接 FFI 呼び出しに変換する。
+//!   - ステータスタスクからの `ServerMessage` ブロードキャストを受け取り、
+//!     JSON テキストフレームとしてクライアントへ転送する。
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -17,7 +17,7 @@ use crate::{btstack, gamepad, protocol::{ClientMessage, ServerMessage}};
 
 pub type StatusTx = Arc<broadcast::Sender<ServerMessage>>;
 
-/// Axum route handler — upgrades an HTTP request to a WebSocket connection.
+/// axum ルートハンドラ — HTTP リクエストを WebSocket 接続にアップグレードする。
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(status_tx): State<StatusTx>,
@@ -26,8 +26,7 @@ pub async fn ws_handler(
 }
 
 async fn handle_socket(socket: WebSocket, status_tx: StatusTx) {
-    let peer_addr = "WebSocket client"; // axum doesn't expose addr here easily
-    tracing::info!("{peer_addr} connected");
+    tracing::info!("WebSocket クライアント接続");
 
     let mut status_rx = status_tx.subscribe();
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -35,7 +34,7 @@ async fn handle_socket(socket: WebSocket, status_tx: StatusTx) {
     loop {
         tokio::select! {
             // ----------------------------------------------------------------
-            // Server → client: status broadcast
+            // サーバー → クライアント: ステータスブロードキャスト
             // ----------------------------------------------------------------
             result = status_rx.recv() => {
                 match result {
@@ -43,21 +42,21 @@ async fn handle_socket(socket: WebSocket, status_tx: StatusTx) {
                         match serde_json::to_string(&msg) {
                             Ok(json) => {
                                 if ws_tx.send(Message::Text(json)).await.is_err() {
-                                    break; // client disconnected
+                                    break; // クライアント切断
                                 }
                             }
-                            Err(e) => tracing::error!("JSON serialisation error: {e}"),
+                            Err(e) => tracing::error!("JSON シリアライズエラー: {e}"),
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Status broadcast lagged by {n} messages");
+                        tracing::warn!("ステータスブロードキャストが {n} メッセージ遅延");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
 
             // ----------------------------------------------------------------
-            // Client → server: gamepad input
+            // クライアント → サーバー: ゲームパッド入力
             // ----------------------------------------------------------------
             msg = ws_rx.next() => {
                 match msg {
@@ -65,12 +64,12 @@ async fn handle_socket(socket: WebSocket, status_tx: StatusTx) {
                         handle_client_message(&text, &mut ws_tx).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        tracing::info!("{peer_addr} disconnected");
+                        tracing::info!("WebSocket クライアント切断");
                         break;
                     }
-                    Some(Ok(_)) => { /* binary / ping / pong — ignore */ }
+                    Some(Ok(_)) => { /* バイナリ / ping / pong は無視 */ }
                     Some(Err(e)) => {
-                        tracing::warn!("{peer_addr} WebSocket error: {e}");
+                        tracing::warn!("WebSocket エラー: {e}");
                         break;
                     }
                 }
@@ -87,9 +86,9 @@ where
     let msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!("Bad client message: {e}  raw={text:?}");
+            tracing::warn!("クライアントメッセージのパース失敗: {e}  raw={text:?}");
             let err = ServerMessage::Error {
-                message: format!("Invalid message: {e}"),
+                message: format!("不正なメッセージ: {e}"),
             };
             if let Ok(json) = serde_json::to_string(&err) {
                 let _ = ws_tx.send(Message::Text(json)).await;
@@ -100,7 +99,7 @@ where
 
     match msg {
         // --------------------------------------------------------------------
-        // Main gamepad input path (called every animation frame by the browser)
+        // メインの入力パス（ブラウザが毎アニメーションフレームに呼び出す）
         // --------------------------------------------------------------------
         ClientMessage::GamepadState { buttons, axes } => {
             let button_flags = gamepad::map_buttons(&buttons);
@@ -112,7 +111,7 @@ where
         }
 
         // --------------------------------------------------------------------
-        // Motion sensors (Web DeviceMotion API)
+        // モーションセンサー（Web DeviceMotion API）
         // --------------------------------------------------------------------
         ClientMessage::Motion { gyro, accel } => {
             let g = |i: usize| gyro.get(i).copied().unwrap_or(0);
@@ -122,7 +121,7 @@ where
         }
 
         // --------------------------------------------------------------------
-        // Controller appearance
+        // コントローラー外観
         // --------------------------------------------------------------------
         ClientMessage::SetColor {
             pad_color,
@@ -141,7 +140,7 @@ where
         }
 
         // --------------------------------------------------------------------
-        // Rumble response config
+        // 振動応答設定
         // --------------------------------------------------------------------
         ClientMessage::RumbleRegister { key } => {
             btstack::set_rumble_response(key);

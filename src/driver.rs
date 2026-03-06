@@ -1,47 +1,49 @@
-//! Windows Bluetooth dongle driver management.
+//! Windows Bluetooth ドングルのドライバ管理。
 //!
-//! BTStack needs the WinUSB driver instead of the native Windows Bluetooth
-//! HCI driver.  This module provides three operations:
+//! BTStack は OS 標準の `BthUsb.sys` の代わりに WinUSB ドライバが必要です。
+//! このモジュールは以下の 3 操作を提供します：
 //!
-//! 1. **list**    — enumerate USB devices that look like Bluetooth dongles.
-//! 2. **install** — write a WinUSB INF and apply it with `pnputil.exe`.
-//! 3. **restore** — remove the WinUSB INF so Windows reinstalls the original
-//!                  Bluetooth driver on next plug-in (or immediately via
-//!                  `devcon update`).
+//! 1. **一覧取得** — Bluetooth ドングルと思われる USB デバイスを列挙する。
+//! 2. **導入**     — WinUSB INF ファイルを生成し `pnputil.exe` で適用する。
+//! 3. **復元**     — WinUSB INF を削除し、次回接続時に Windows が元の
+//!                   Bluetooth ドライバを再適用できるようにする
+//!                   （`devcon update` でその場で適用も試みる）。
 //!
-//! All driver changes require an **Administrator** token.  The server should
-//! be started with elevated privileges, or UAC prompts will appear.
+//! ドライバ変更にはすべて **管理者権限** が必要です。
+//! サーバーを管理者として起動するか、UAC の確認ダイアログを受け入れてください。
 //!
-//! On non-Windows targets every function returns empty / no-op results so the
-//! crate still compiles for development.
+//! Windows 以外のビルドでは全関数が空のスタブになるため、
+//! Linux 等でも問題なくコンパイルできます。
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
-// Public types
+// 公開型
 // ---------------------------------------------------------------------------
 
+/// Bluetooth USB デバイスの情報。
 #[derive(Debug, Clone, Serialize)]
 pub struct BtUsbDevice {
-    /// USB Vendor ID (hex string, e.g. "0a12")
+    /// USB ベンダー ID（小文字16進数、例: "0a12"）
     pub vid: String,
-    /// USB Product ID (hex string, e.g. "0001")
+    /// USB プロダクト ID（小文字16進数、例: "0001"）
     pub pid: String,
-    /// Human-readable device description
+    /// デバイスの説明文字列
     pub description: String,
-    /// Currently active driver (e.g. "WinUSB", "BthUsb", "Unknown")
+    /// 現在適用中のドライバ（例: "WinUSB"、"BthUsb"、"Unknown"）
     pub driver: String,
 }
 
 // ---------------------------------------------------------------------------
-// Windows implementation
+// Windows 実装
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
 mod platform {
     use super::*;
 
+    /// INF ファイルを保存するディレクトリ
     const INF_DIR: &str = r"C:\Windows\Temp";
 
     fn inf_name(vid: u16, pid: u16) -> String {
@@ -51,16 +53,17 @@ mod platform {
         format!(r"{INF_DIR}\{}", inf_name(vid, pid))
     }
 
-    // ---- List ---------------------------------------------------------------
+    // ---- デバイス一覧 -------------------------------------------------------
 
+    /// Bluetooth クラスに属する USB デバイスを PowerShell / WMI で列挙する。
     pub async fn list_bt_usb_devices() -> Result<Vec<BtUsbDevice>> {
-        // Use PowerShell + Win32_PnPEntity to find Bluetooth USB devices.
-        // Filtering on Class == "Bluetooth" catches most dongles.
         let output = tokio::process::Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
+                // PNPClass が Bluetooth のデバイス、または Description に
+                // "Bluetooth" が含まれるデバイスを JSON として出力する
                 r#"
 Get-WmiObject Win32_PnPEntity |
   Where-Object { $_.PNPClass -eq 'Bluetooth' -or $_.Description -match 'Bluetooth' } |
@@ -70,11 +73,11 @@ Get-WmiObject Win32_PnPEntity |
             ])
             .output()
             .await
-            .context("Failed to run PowerShell for device enumeration")?;
+            .context("PowerShell によるデバイス列挙に失敗しました")?;
 
         if !output.status.success() {
             let msg = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("PowerShell error: {msg}"));
+            return Err(anyhow::anyhow!("PowerShell エラー: {msg}"));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -83,8 +86,7 @@ Get-WmiObject Win32_PnPEntity |
             return Ok(vec![]);
         }
 
-        // PowerShell may return a single object or an array.
-        // Normalise to array.
+        // PowerShell は単一オブジェクトまたは配列を返す場合があるため統一する
         let json_str = if stdout.starts_with('[') {
             stdout.to_string()
         } else {
@@ -101,19 +103,18 @@ Get-WmiObject Win32_PnPEntity |
             service: Option<String>,
         }
 
-        let entries: Vec<PnpEntry> = serde_json::from_str(&json_str)
-            .unwrap_or_default();
+        let entries: Vec<PnpEntry> = serde_json::from_str(&json_str).unwrap_or_default();
 
         let mut devices = Vec::new();
         for entry in entries {
             let device_id = entry.device_id.unwrap_or_default();
-            // Parse VID/PID from device ID like "USB\VID_0A12&PID_0001\..."
+            // "USB\VID_0A12&PID_0001\..." 形式から VID/PID を抽出
             let (vid, pid) = parse_vid_pid(&device_id);
             devices.push(BtUsbDevice {
                 vid,
                 pid,
-                description: entry.description.unwrap_or_else(|| "Unknown".into()),
-                driver: entry.service.unwrap_or_else(|| "Unknown".into()),
+                description: entry.description.unwrap_or_else(|| "不明".into()),
+                driver:      entry.service.unwrap_or_else(|| "不明".into()),
             });
         }
         Ok(devices)
@@ -123,10 +124,7 @@ Get-WmiObject Win32_PnPEntity |
         let upper = device_id.to_uppercase();
         let vid = extract_id_field(&upper, "VID_");
         let pid = extract_id_field(&upper, "PID_");
-        (
-            vid.to_lowercase(),
-            pid.to_lowercase(),
-        )
+        (vid.to_lowercase(), pid.to_lowercase())
     }
 
     fn extract_id_field<'a>(s: &'a str, prefix: &str) -> &'a str {
@@ -142,33 +140,37 @@ Get-WmiObject Win32_PnPEntity |
         }
     }
 
-    // ---- Install WinUSB driver ----------------------------------------------
+    // ---- WinUSB ドライバ導入 -----------------------------------------------
 
+    /// 指定した VID/PID の USB デバイスに WinUSB ドライバを導入する。
+    /// INF ファイルを生成し `pnputil /add-driver` で適用します。
+    /// 管理者権限が必要です。
     pub async fn install_winusb(vid: u16, pid: u16) -> Result<String> {
         let inf_path = inf_path(vid, pid);
 
-        // Write the INF file.
+        // WinUSB 用 INF ファイルを書き出す
         write_winusb_inf(vid, pid, &inf_path)?;
 
-        // Install via pnputil — requires administrator rights.
+        // pnputil でドライバストアに追加してデバイスに適用
         let output = tokio::process::Command::new("pnputil")
             .args(["/add-driver", &inf_path, "/install"])
             .output()
             .await
-            .context("Failed to run pnputil /add-driver")?;
+            .context("pnputil /add-driver の実行に失敗しました")?;
 
         if output.status.success() {
-            tracing::info!("WinUSB driver installed for {:04x}:{:04x}", vid, pid);
-            Ok(format!("WinUSB driver installed for {:04x}:{:04x}", vid, pid))
+            let msg = format!("WinUSB ドライバを導入しました ({vid:04x}:{pid:04x})");
+            tracing::info!("{msg}");
+            Ok(msg)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(anyhow::anyhow!("pnputil /add-driver failed: {stderr}"))
+            Err(anyhow::anyhow!("pnputil /add-driver 失敗: {stderr}"))
         }
     }
 
+    /// WinUSB 用の最小限の INF ファイルを生成する。
+    /// Zadig / libwdi が生成するものと同等の内容です。
     fn write_winusb_inf(vid: u16, pid: u16, path: &str) -> Result<()> {
-        // A minimal WinUSB INF.  Generated at runtime so no bundled files are
-        // needed.  This matches what Zadig/libwdi produces for generic devices.
         let inf = format!(
             r#"[Version]
 Signature   = "$Windows NT$"
@@ -229,17 +231,20 @@ WinUSB_SvcDesc = "WinUSB"
         );
 
         std::fs::write(path, inf)
-            .with_context(|| format!("Failed to write INF to {path}"))?;
+            .with_context(|| format!("INF ファイルの書き込みに失敗しました: {path}"))?;
         Ok(())
     }
 
-    // ---- Restore original driver --------------------------------------------
+    // ---- 元ドライバへの復元 -------------------------------------------------
 
+    /// WinUSB ドライバを削除し、元の Bluetooth ドライバに戻す。
+    ///
+    /// 戦略 1: `pnputil /delete-driver /uninstall /force` で INF を削除する。
+    /// 戦略 2: `devcon update` で直接 BthUsb ドライバを適用する（ベストエフォート）。
     pub async fn restore_driver(vid: u16, pid: u16) -> Result<String> {
-        // Strategy 1: Remove our WinUSB INF from the driver store.
-        // After removal, Windows will re-scan and apply the next-best driver
-        // (usually the inbox BthUsb driver) on next plug-in or after devcon.
         let inf = inf_name(vid, pid);
+
+        // まず pnputil でドライバストアから INF を削除する
         let del = tokio::process::Command::new("pnputil")
             .args(["/delete-driver", &inf, "/uninstall", "/force"])
             .output()
@@ -247,50 +252,52 @@ WinUSB_SvcDesc = "WinUSB"
 
         match del {
             Ok(out) if out.status.success() => {
-                let msg = format!("WinUSB driver removed for {:04x}:{:04x}", vid, pid);
+                let msg = format!("WinUSB ドライバを削除しました ({vid:04x}:{pid:04x})");
                 tracing::info!("{msg}");
-                // Also trigger immediate driver update via devcon (best-effort).
+                // さらに devcon で即時ドライバ更新を試みる（ベストエフォート）
                 update_via_devcon(vid, pid).await;
                 return Ok(msg);
             }
             _ => {
-                tracing::warn!("pnputil /delete-driver failed; trying devcon");
+                tracing::warn!("pnputil /delete-driver 失敗。devcon を試みます");
             }
         }
 
-        // Strategy 2: Use devcon to apply the inbox Bluetooth driver directly.
+        // pnputil が失敗した場合は devcon で直接適用を試みる
         update_via_devcon(vid, pid).await;
         Ok(format!(
-            "Driver restore attempted for {:04x}:{:04x} (check Device Manager)",
-            vid, pid
+            "{vid:04x}:{pid:04x} のドライバ復元を試みました（デバイスマネージャーで確認してください）"
         ))
     }
 
+    /// devcon.exe を使って Windows 標準 Bluetooth ドライバを適用する。
+    /// devcon は WDK / Windows SDK に含まれているため、
+    /// インストールされていない環境では警告のみを出してスキップします。
     async fn update_via_devcon(vid: u16, pid: u16) {
         let hwid = format!("USB\\VID_{:04X}&PID_{:04X}", vid, pid);
-        // devcon.exe is not shipped with Windows but is part of the WDK /
-        // Windows SDK.  We try it as a best-effort step.
         let result = tokio::process::Command::new("devcon")
             .args(["update", r"C:\Windows\INF\bth.inf", &hwid])
             .output()
             .await;
         match result {
             Ok(out) if out.status.success() => {
-                tracing::info!("devcon update succeeded for {hwid}");
+                tracing::info!("devcon update 成功: {hwid}");
             }
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::warn!("devcon update failed for {hwid}: {stderr}");
+                tracing::warn!("devcon update 失敗 ({hwid}): {stderr}");
             }
             Err(e) => {
-                tracing::warn!("devcon not found or failed ({e}); driver may need manual restore");
+                tracing::warn!(
+                    "devcon が見つからないか実行できません ({e})。手動でドライバを復元してください"
+                );
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Non-Windows stub
+// 非 Windows スタブ
 // ---------------------------------------------------------------------------
 
 #[cfg(not(windows))]
@@ -302,16 +309,16 @@ mod platform {
     }
 
     pub async fn install_winusb(_vid: u16, _pid: u16) -> Result<String> {
-        Err(anyhow::anyhow!("Driver management is only supported on Windows"))
+        Err(anyhow::anyhow!("ドライバ管理は Windows のみサポートしています"))
     }
 
     pub async fn restore_driver(_vid: u16, _pid: u16) -> Result<String> {
-        Err(anyhow::anyhow!("Driver management is only supported on Windows"))
+        Err(anyhow::anyhow!("ドライバ管理は Windows のみサポートしています"))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Public re-exports
+// 公開再エクスポート
 // ---------------------------------------------------------------------------
 
 pub use platform::{install_winusb, list_bt_usb_devices, restore_driver};

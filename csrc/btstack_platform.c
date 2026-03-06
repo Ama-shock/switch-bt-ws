@@ -1,16 +1,16 @@
 /*
  * btstack_platform.c
  *
- * BTStack Windows/WinUSB platform initialisation for Rust integration.
+ * Rust 統合のための BTStack Windows/WinUSB プラットフォーム初期化。
  *
- * This is a lightly-modified copy of port/windows-winusb/main.c.
- * The only structural change is that the C entry-point "main()" has been
- * renamed to "btstack_platform_run()" so it does not conflict with Rust's
- * own main() when linking the static library.
+ * port/windows-winusb/main.c を軽微に改変したファイルです。
+ * 唯一の構造的な変更点は、C のエントリーポイント "main()" を
+ * "btstack_platform_run()" にリネームしたことです。
+ * これにより、静的ライブラリをリンクした際に Rust 自身の main() と
+ * シンボルが衝突しなくなります。
  *
- * start_gamepad()    — called by Rust on a dedicated OS thread; blocks until
- *                      shutdown is requested.
- * shutdown_gamepad() — called by Rust to initiate a clean shutdown.
+ * start_gamepad()    — Rust から専用 OS スレッドで呼び出す。シャットダウンまでブロック。
+ * shutdown_gamepad() — Rust からクリーンシャットダウンを開始するために呼び出す。
  */
 
 #define BTSTACK_FILE__ "btstack_platform.c"
@@ -42,11 +42,12 @@
 #include "hci_transport.h"
 #include "hci_transport_usb.h"
 
-/* Forward declaration — implemented in btkeyLib.c */
+/* btkeyLib.c で実装されている */
 int btstack_main(int argc, const char * argv[]);
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
+/* TLV リンクキーデータベースのファイル名プレフィックス / サフィックス */
 #define TLV_DB_PATH_PREFIX  "btstack_"
 #define TLV_DB_PATH_POSTFIX ".tlv"
 
@@ -57,9 +58,12 @@ static bd_addr_t             local_addr;
 static bool                  shutdown_triggered;
 
 /* ---------------------------------------------------------------------- */
-/* Internal helpers                                                         */
+/* 内部ヘルパー                                                             */
 /* ---------------------------------------------------------------------- */
 
+/* BTStack の状態変化イベントを処理する。
+ * HCI_STATE_WORKING 時に TLV データベースを初期化し、
+ * HCI_STATE_OFF 時にクリーンアップを行う。 */
 static void packet_handler(uint8_t packet_type, uint16_t channel,
                             uint8_t *packet, uint16_t size)
 {
@@ -72,8 +76,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     switch (btstack_event_state_get_state(packet)) {
         case HCI_STATE_WORKING:
             gap_local_bd_addr(local_addr);
-            printf("[btstack] Running on %s\n", bd_addr_to_str(local_addr));
+            printf("[btstack] 動作中: %s\n", bd_addr_to_str(local_addr));
 
+            /* ローカル BD アドレスを使った TLV パスを構築 */
             btstack_strcpy(tlv_db_path, sizeof(tlv_db_path), TLV_DB_PATH_PREFIX);
             btstack_strcat(tlv_db_path, sizeof(tlv_db_path),
                            bd_addr_to_str_with_delimiter(local_addr, '-'));
@@ -94,8 +99,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
             btstack_tlv_windows_deinit(&tlv_context);
             if (!shutdown_triggered) break;
             btstack_stdin_reset();
-            log_info("BTstack shut down cleanly.");
-            /* The run loop will return after this, ending btstack_platform_run(). */
+            log_info("BTStack が正常にシャットダウンしました。");
+            /* この後ランループが返り、btstack_platform_run() が終了する */
             break;
 
         default:
@@ -103,15 +108,16 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     }
 }
 
+/* シャットダウンを開始する。CTRL-C ハンドラおよび shutdown_gamepad() から呼ばれる。 */
 static void trigger_shutdown(void)
 {
-    printf("[btstack] Shutdown requested.\n");
-    log_info("trigger_shutdown: powering off HCI");
+    printf("[btstack] シャットダウン要求を受け付けました。\n");
+    log_info("trigger_shutdown: HCI 電源オフを要求");
     shutdown_triggered = true;
     hci_power_control(HCI_POWER_OFF);
 }
 
-/* hal_led_toggle() is required by some BTStack platform code */
+/* 一部の BTStack プラットフォームコードから必要とされる LED トグル関数 */
 static int led_state = 0;
 void hal_led_toggle(void)
 {
@@ -119,47 +125,49 @@ void hal_led_toggle(void)
 }
 
 /* ---------------------------------------------------------------------- */
-/* Platform run — replaces main() from the original port                   */
+/* プラットフォーム実行関数 — 元の main() の置き換え                        */
 /* ---------------------------------------------------------------------- */
 
 static void btstack_platform_run(void)
 {
-    /* Unbuffered stdout so log lines appear immediately */
+    /* ログ行がすぐに表示されるよう標準出力のバッファリングを無効化 */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    printf("[btstack] switch-bt-ws platform starting\n");
+    printf("[btstack] switch-bt-ws プラットフォーム起動\n");
 
-    /* Core init */
+    /* コア初期化 */
     btstack_memory_init();
     btstack_run_loop_init(btstack_run_loop_windows_get_instance());
 
-    /* USB HCI transport (WinUSB dongle) */
+    /* USB HCI トランスポート（WinUSB ドングル） */
     hci_init(hci_transport_usb_instance(), NULL);
 
-    /* State notifications (for TLV setup and shutdown) */
+    /* 状態通知ハンドラを登録（TLV 初期化・シャットダウン処理用） */
     hci_event_callback_registration.callback = &packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
 
-    /* Register CTRL-C handler so a console kill triggers a clean shutdown */
+    /* コンソールで CTRL-C が押されたときクリーンシャットダウンを実行 */
     btstack_stdin_windows_init();
     btstack_stdin_window_register_ctrl_c_callback(&trigger_shutdown);
 
-    /* Initialise the Pro Controller emulator (btkeyLib.c) */
+    /* Pro Controller エミュレーターを初期化（btkeyLib.c） */
     btstack_main(0, NULL);
 
-    /* Block here until shutdown */
+    /* シャットダウンされるまでここでブロック */
     btstack_run_loop_execute();
 }
 
 /* ---------------------------------------------------------------------- */
-/* Public API called from Rust                                              */
+/* Rust から呼び出す公開 API                                                */
 /* ---------------------------------------------------------------------- */
 
+/* BTStack を初期化してランループを開始する。シャットダウンまでブロック。 */
 void start_gamepad(void)
 {
     btstack_platform_run();
 }
 
+/* クリーンシャットダウンを要求する。 */
 void shutdown_gamepad(void)
 {
     trigger_shutdown();

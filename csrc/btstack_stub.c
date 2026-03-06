@@ -1,9 +1,9 @@
 /*
  * btstack_stub.c
  *
- * No-op stubs for all symbols exported by btkeyLib.c / btstack_platform.c.
- * Used when building on non-Windows platforms (Linux, macOS) so that the
- * Rust crate compiles cleanly for development and CI purposes.
+ * btkeyLib.c / btstack_platform.c がエクスポートする全シンボルの空スタブ。
+ * Windows 以外のプラットフォーム（Linux、macOS 等）でビルドする際に使用します。
+ * これにより開発環境や CI でも Rust クレートがコンパイルできます。
  */
 
 #include <stdbool.h>
