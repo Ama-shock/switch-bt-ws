@@ -8,8 +8,7 @@
 #   3. x86_64-pc-windows-gnu ターゲットで cargo build --release
 #
 # ビルド方法:
-#   docker build -t switch-bt-ws-builder .
-#   docker run --rm -v "$(pwd)/dist:/out" switch-bt-ws-builder
+#   docker compose up build
 #
 # 成果物:
 #   dist/switch-bt-ws.exe
@@ -64,7 +63,8 @@ ENV BTSTACK_ROOT=/btstack/windows
 RUN cargo build --release --target x86_64-pc-windows-gnu
 
 # ---------------------------------------------------------------------------
-# 成果物をエクスポートステージへコピー
+# 成果物を /out にコピーする軽量ステージ
 # ---------------------------------------------------------------------------
-FROM scratch AS export
-COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/switch-bt-ws.exe /switch-bt-ws.exe
+FROM debian:bookworm-slim AS export
+COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/switch-bt-ws.exe /artifact/switch-bt-ws.exe
+CMD ["cp", "/artifact/switch-bt-ws.exe", "/out/switch-bt-ws.exe"]

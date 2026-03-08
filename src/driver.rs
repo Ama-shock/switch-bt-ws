@@ -57,19 +57,30 @@ mod platform {
 
     // ---- デバイス一覧 -------------------------------------------------------
 
-    /// Bluetooth クラスに属する USB デバイスを PowerShell / WMI で列挙する。
+    /// Bluetooth ドングルと思われる USB デバイスを PowerShell / WMI で列挙する。
+    ///
+    /// WinUSB に入れ替え済みのデバイスは PNPClass が "USBDevice" に変わるため、
+    /// Bluetooth クラスだけでなく以下の条件でも取得する:
+    ///   - PNPClass が "Bluetooth" / Description に "Bluetooth" を含む
+    ///   - Service が "WinUSB"（BTStack 用に入れ替え済み）
+    ///   - DeviceID が USB\VID_ で始まり、既知の BT ドングル VID/PID に一致する
     pub async fn list_bt_usb_devices() -> Result<Vec<BtUsbDevice>> {
         let output = tokio::process::Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                // PNPClass が Bluetooth のデバイス、または Description に
-                // "Bluetooth" が含まれるデバイスを JSON として出力する
                 r#"
 Get-WmiObject Win32_PnPEntity |
-  Where-Object { $_.PNPClass -eq 'Bluetooth' -or $_.Description -match 'Bluetooth' } |
-  Select-Object DeviceID, Description, Service |
+  Where-Object {
+    ($_.DeviceID -match '^USB\\') -and (
+      $_.PNPClass -eq 'Bluetooth' -or
+      $_.Description -match 'Bluetooth' -or
+      $_.Service -eq 'WinUSB' -or
+      $_.Service -eq 'WinUsb'
+    )
+  } |
+  Select-Object DeviceID, Description, Service, PNPClass |
   ConvertTo-Json -Compress
 "#,
             ])
@@ -103,6 +114,8 @@ Get-WmiObject Win32_PnPEntity |
             description: Option<String>,
             #[serde(rename = "Service")]
             service: Option<String>,
+            #[serde(rename = "PNPClass")]
+            pnp_class: Option<String>,
         }
 
         let entries: Vec<PnpEntry> = serde_json::from_str(&json_str).unwrap_or_default();
@@ -113,15 +126,23 @@ Get-WmiObject Win32_PnPEntity |
         let mut devices = Vec::new();
         for entry in entries {
             let device_id = entry.device_id.unwrap_or_default();
+            // USB\ で始まるデバイスのみ対象
+            if !device_id.starts_with("USB\\") {
+                continue;
+            }
             // "USB\VID_0A12&PID_0001\..." 形式から VID/PID を抽出
             let (vid, pid) = parse_vid_pid(&device_id);
+            if vid == "0000" && pid == "0000" {
+                continue;
+            }
             let key = (vid.clone(), pid.clone());
             let instance = *instance_counters.entry(key).and_modify(|c| *c += 1).or_insert(0);
+            let driver = entry.service.unwrap_or_else(|| "不明".into());
             devices.push(BtUsbDevice {
                 vid,
                 pid,
                 description: entry.description.unwrap_or_else(|| "不明".into()),
-                driver:      entry.service.unwrap_or_else(|| "不明".into()),
+                driver,
                 instance,
             });
         }
