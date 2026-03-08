@@ -172,7 +172,10 @@ Get-WmiObject Win32_PnPEntity |
     // ---- WinUSB ドライバ導入 -----------------------------------------------
 
     /// 指定した VID/PID の USB デバイスに WinUSB ドライバを導入する。
-    /// INF ファイルを生成し `pnputil /add-driver` で適用します。
+    /// INF ファイルを生成し `UpdateDriverForPlugAndPlayDevicesW` (newdev.dll) で
+    /// デバイスのドライバを強制更新します。
+    /// pnputil は署名なし INF を拒否するため、Win32 API を直接使用します。
+    /// 署名なしドライバの場合、Windows が信頼確認ダイアログを表示します。
     /// 管理者権限が必要です。
     pub async fn install_winusb(vid: u16, pid: u16) -> Result<String> {
         let inf_path = inf_path(vid, pid);
@@ -180,20 +183,75 @@ Get-WmiObject Win32_PnPEntity |
         // WinUSB 用 INF ファイルを書き出す
         write_winusb_inf(vid, pid, &inf_path)?;
 
-        // pnputil でドライバストアに追加してデバイスに適用
-        let output = tokio::process::Command::new("pnputil")
-            .args(["/add-driver", &inf_path, "/install"])
+        let hwid = format!("USB\\\\VID_{vid:04X}&PID_{pid:04X}");
+
+        // PowerShell 経由で UpdateDriverForPlugAndPlayDevicesW を P/Invoke 呼び出し。
+        // この API は HWID を指定して該当デバイスのドライバを直接更新する。
+        // DiInstallDriverW はドライバストアへの追加のみで既存デバイスを
+        // 更新しないことがあるため、こちらを使用する。
+        let ps_script = format!(
+            r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.ComponentModel;
+
+public class WinUsbInstaller {{
+    [DllImport("newdev.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool UpdateDriverForPlugAndPlayDevicesW(
+        IntPtr hwndParent,
+        string HardwareId,
+        string FullInfPath,
+        uint InstallFlags,
+        out bool bRebootRequired
+    );
+
+    public static void Install(string hwid, string infPath) {{
+        bool needReboot = false;
+        // INSTALLFLAG_FORCE = 0x01 : 現在のドライバより低ランクでも強制適用
+        bool result = UpdateDriverForPlugAndPlayDevicesW(
+            IntPtr.Zero, hwid, infPath, 0x01, out needReboot);
+        if (!result) {{
+            int err = Marshal.GetLastWin32Error();
+            throw new Win32Exception(err);
+        }}
+        if (needReboot) {{
+            Console.WriteLine("REBOOT_REQUIRED");
+        }}
+    }}
+}}
+"@
+
+[WinUsbInstaller]::Install("{hwid}", "{inf_path}")
+Write-Output "OK"
+"#,
+            hwid = hwid,
+            inf_path = inf_path.replace('\\', "\\\\"),
+        );
+
+        let output = tokio::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
             .output()
             .await
-            .context("pnputil /add-driver の実行に失敗しました")?;
+            .context("UpdateDriverForPlugAndPlayDevicesW の実行に失敗しました")?;
 
-        if output.status.success() {
-            let msg = format!("WinUSB ドライバを導入しました ({vid:04x}:{pid:04x})");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if output.status.success() && stdout.contains("OK") {
+            let mut msg = format!("WinUSB ドライバを導入しました ({vid:04x}:{pid:04x})");
+            if stdout.contains("REBOOT_REQUIRED") {
+                msg.push_str("（再起動が必要です）");
+            }
             tracing::info!("{msg}");
             Ok(msg)
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(anyhow::anyhow!("pnputil /add-driver 失敗: {stderr}"))
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            Err(anyhow::anyhow!("WinUSB ドライバの導入に失敗しました: {detail}"))
         }
     }
 
@@ -207,7 +265,6 @@ Class       = "USBDevice"
 ClassGUID   = {{88BAE032-5A81-49f0-BC3D-A4FF138216D6}}
 Provider    = %ProviderName%
 DriverVer   = 06/21/2006,6.1.7600.16385
-CatalogFile = winusbcoinstaller.cat
 
 [ClassInstall32]
 AddReg = WinUSBDeviceClassReg
