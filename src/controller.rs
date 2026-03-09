@@ -41,6 +41,8 @@ pub struct ControllerInfo {
     pub rumble: bool,
     /// ペアリングループ中か
     pub syncing: bool,
+    /// Switch が割り当てたプレイヤー番号（1〜4）。未割当なら 0。
+    pub player: u8,
 }
 
 /// コントローラーの状態（内部用）。
@@ -52,6 +54,7 @@ struct ControllerState {
     paired: bool,
     rumble: bool,
     syncing: bool,
+    player: u8,
 }
 
 /// 個々のワーカープロセスへのハンドル。
@@ -85,6 +88,7 @@ impl ControllerHandle {
             paired: state.paired,
             rumble: state.rumble,
             syncing: state.syncing,
+            player: state.player,
         }
     }
 
@@ -147,6 +151,7 @@ impl ControllerManager {
             paired: false,
             rumble: false,
             syncing: false,
+            player: 0,
         }));
 
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
@@ -190,58 +195,6 @@ impl ControllerManager {
             .cloned()
             .with_context(|| format!("コントローラー id={id} が見つかりません"))?;
         handle.send(WorkerCommand::Shutdown);
-        Ok(())
-    }
-
-    /// コントローラーに再接続シグナルを送信する。
-    pub async fn reconnect(&self, id: u32) -> Result<()> {
-        let handle = self
-            .controllers
-            .read()
-            .await
-            .get(&id)
-            .cloned()
-            .with_context(|| format!("コントローラー id={id} が見つかりません"))?;
-        handle.send(WorkerCommand::Reconnect);
-        Ok(())
-    }
-
-    /// シンクロボタン長押し相当（リンクキー全削除 + HCI リセット）。
-    pub async fn sync(&self, id: u32) -> Result<()> {
-        let handle = self
-            .controllers
-            .read()
-            .await
-            .get(&id)
-            .cloned()
-            .with_context(|| format!("コントローラー id={id} が見つかりません"))?;
-        handle.send(WorkerCommand::Sync);
-        Ok(())
-    }
-
-    /// ペアリングループ開始（接続されるまでシンクロを繰り返す）。
-    pub async fn sync_start(&self, id: u32) -> Result<()> {
-        let handle = self
-            .controllers
-            .read()
-            .await
-            .get(&id)
-            .cloned()
-            .with_context(|| format!("コントローラー id={id} が見つかりません"))?;
-        handle.send(WorkerCommand::SyncStart);
-        Ok(())
-    }
-
-    /// ペアリングループ停止。
-    pub async fn sync_stop(&self, id: u32) -> Result<()> {
-        let handle = self
-            .controllers
-            .read()
-            .await
-            .get(&id)
-            .cloned()
-            .with_context(|| format!("コントローラー id={id} が見つかりません"))?;
-        handle.send(WorkerCommand::SyncStop);
         Ok(())
     }
 
@@ -301,11 +254,12 @@ async fn stdout_reader(
         }
         match serde_json::from_str::<WorkerEvent>(&line) {
             Ok(event) => {
-                if let WorkerEvent::Status { paired, rumble, syncing } = &event {
+                if let WorkerEvent::Status { paired, rumble, syncing, player } = &event {
                     let mut s = state.write().await;
                     s.paired = *paired;
                     s.rumble = *rumble;
                     s.syncing = *syncing;
+                    s.player = *player;
                 }
                 let _ = status_tx.send(event);
             }

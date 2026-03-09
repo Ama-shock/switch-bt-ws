@@ -94,7 +94,8 @@ async fn handle_socket(socket: WebSocket, handle: Arc<ControllerHandle>) {
 
 fn worker_event_to_server_msg(event: WorkerEvent) -> Option<ServerMessage> {
     match event {
-        WorkerEvent::Status { paired, rumble, .. } => Some(ServerMessage::Status { paired, rumble }),
+        WorkerEvent::Status { paired, rumble, syncing, player } => Some(ServerMessage::Status { paired, rumble, syncing, player }),
+        WorkerEvent::LinkKeys { data } => Some(ServerMessage::LinkKeys { data }),
         WorkerEvent::Error { message } => Some(ServerMessage::Error { message }),
         _ => None,
     }
@@ -125,8 +126,8 @@ async fn dispatch_client_message<S>(
     };
 
     match msg {
-        ClientMessage::GamepadState { buttons, axes } => {
-            let button_flags = gamepad::map_buttons(&buttons);
+        ClientMessage::GamepadState { button_status, buttons, axes } => {
+            let button_flags = button_status.unwrap_or_else(|| gamepad::map_buttons(&buttons));
             handle.send(WorkerCommand::Button { button_status: button_flags });
 
             let (lh, lv, rh, rv) = gamepad::map_axes(&axes);
@@ -152,6 +153,18 @@ async fn dispatch_client_message<S>(
         }
         ClientMessage::RumbleRegister { key } => {
             handle.send(WorkerCommand::RumbleRegister { key });
+        }
+        ClientMessage::Reconnect { link_keys } => {
+            handle.send(WorkerCommand::Reconnect { link_keys });
+        }
+        ClientMessage::SyncStart => {
+            handle.send(WorkerCommand::SyncStart);
+        }
+        ClientMessage::SyncStop => {
+            handle.send(WorkerCommand::SyncStop);
+        }
+        ClientMessage::GetLinkKeys => {
+            handle.send(WorkerCommand::GetLinkKeys);
         }
     }
 }

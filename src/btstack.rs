@@ -80,6 +80,18 @@ extern "C" {
     /// apply_patches.sh によって hci_transport_h2_winusb.c に追加された関数。
     /// 非 Windows では btstack_stub.c の空スタブが使われる。
     fn hci_transport_usb_set_target(vid: u16, pid: u16, instance: i32);
+
+    /// メモリ上のリンクキーをバイト列としてエクスポートする。
+    /// 各エントリ 23 バイト: BD_ADDR(6) + link_key(16) + key_type(1)。
+    /// 書き込んだバイト数を返す。
+    fn export_link_keys(buf: *mut u8, buf_size: i32) -> i32;
+
+    /// バイト列からリンクキーをインポートする（フォーマットは export_link_keys と同じ）。
+    fn import_link_keys(buf: *const u8, len: i32);
+
+    /// Switch が割り当てたプレイヤー LED のビットパターンを返す。
+    /// P1=0x01, P2=0x03, P3=0x07, P4=0x0F（累積パターン）。
+    fn get_player_leds() -> u8;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,5 +177,32 @@ pub fn send_amiibo(path: &str) {
     match CString::new(path) {
         Ok(cstr) => unsafe { ffi_send_amiibo(cstr.as_ptr()) },
         Err(_) => tracing::warn!("send_amiibo: パスに NUL バイトが含まれています: {path:?}"),
+    }
+}
+
+/// メモリ上のリンクキーを Vec<u8> としてエクスポートする。
+pub fn get_link_keys() -> Vec<u8> {
+    // 最大 16 エントリ分 (23 * 16 = 368 bytes)
+    let mut buf = vec![0u8; 23 * 16];
+    let len = unsafe { export_link_keys(buf.as_mut_ptr(), buf.len() as i32) };
+    buf.truncate(len as usize);
+    buf
+}
+
+/// バイト列からリンクキーをインポートする。
+pub fn set_link_keys(data: &[u8]) {
+    unsafe { import_link_keys(data.as_ptr(), data.len() as i32) }
+}
+
+/// Switch が割り当てたプレイヤー番号（1〜4）を返す。未割当なら 0。
+/// LED ビットパターン: P1=0x01, P2=0x03, P3=0x07, P4=0x0F。
+pub fn get_player_number() -> u8 {
+    let leds = unsafe { get_player_leds() } & 0x0F;
+    match leds {
+        0x0F => 4,
+        0x07 => 3,
+        0x03 => 2,
+        0x01 => 1,
+        _ => 0,
     }
 }

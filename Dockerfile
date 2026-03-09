@@ -62,9 +62,14 @@ RUN bash patches/apply_patches.sh /btstack/windows
 ENV BTSTACK_ROOT=/btstack/windows
 RUN cargo build --release --target x86_64-pc-windows-gnu
 
+# Cargo.toml からバージョンを取得してファイル名に付与
+RUN VERSION=$(grep '^version' /app/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/') && \
+    cp /app/target/x86_64-pc-windows-gnu/release/switch-bt-ws.exe \
+       /app/target/x86_64-pc-windows-gnu/release/switch-bt-ws-v${VERSION}.exe
+
 # ---------------------------------------------------------------------------
 # 成果物を /out にコピーする軽量ステージ
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS export
-COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/switch-bt-ws.exe /artifact/switch-bt-ws.exe
-CMD ["cp", "/artifact/switch-bt-ws.exe", "/out/switch-bt-ws.exe"]
+COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/switch-bt-ws-v*.exe /artifact/
+CMD ["sh", "-c", "cp /artifact/switch-bt-ws-v*.exe /out/"]

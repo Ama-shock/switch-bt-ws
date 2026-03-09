@@ -64,9 +64,17 @@ where
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// Web Gamepad API から取得したゲームパッド状態。
+    ///
+    /// `button_status` が指定されている場合はキーマップ適用済みビットマスクとして
+    /// そのままワーカーに転送する。未指定の場合は `buttons` 配列からサーバー側で
+    /// デフォルトマッピングを適用する。
     GamepadState {
+        /// キーマップ適用済みボタンビットマスク（フロントエンドでマッピング済み）。
+        #[serde(default)]
+        button_status: Option<u32>,
         /// ボタン値（インデックス 0〜17）。0.5 以上を押下とみなす。
         /// bool (true/false) または f32 (0.0〜1.0) のどちらでも受け付ける。
+        /// `button_status` 未指定時のフォールバック。
         #[serde(default, deserialize_with = "deserialize_flexible_f32_vec")]
         buttons: Vec<f32>,
         /// 軸値。-1.0〜1.0 または 0〜4095（マッピング済み）のどちらでも受け付ける。
@@ -97,6 +105,21 @@ pub enum ClientMessage {
 
     /// 振動イベント時に押下するボタンマスクを登録する。
     RumbleRegister { key: u32 },
+
+    /// HCI を再起動して再接続を試みる（リンクキー付き）。
+    Reconnect {
+        #[serde(default)]
+        link_keys: Option<String>,
+    },
+
+    /// ペアリングループ開始。
+    SyncStart,
+
+    /// ペアリングループ停止。
+    SyncStop,
+
+    /// リンクキーのエクスポートを要求する。
+    GetLinkKeys,
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +135,15 @@ pub enum ServerMessage {
         paired: bool,
         /// Switch が現在振動を要求しているなら true。
         rumble: bool,
+        /// ペアリングループ中か。
+        syncing: bool,
+        /// Switch が割り当てたプレイヤー番号（1〜4）。未割当なら 0。
+        player: u8,
     },
+
+    /// リンクキーデータ（base64）。ペアリング成功時に自動送信。
+    /// ブラウザは IndexedDB にドングル ID をキーにして保存する。
+    LinkKeys { data: String },
 
     /// クライアントからの不正・処理不能なメッセージへのエラー応答。
     Error { message: String },

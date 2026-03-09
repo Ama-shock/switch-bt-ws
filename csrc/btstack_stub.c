@@ -24,3 +24,6 @@ void  send_amiibo(const char *path)                                    { (void)p
 void  reconnect_gamepad(void)                                          {}
 void  sync_gamepad(void)                                               {}
 void  hci_transport_usb_set_target(unsigned short vid, unsigned short pid, int instance) { (void)vid; (void)pid; (void)instance; }
+int   export_link_keys(unsigned char *buf, int buf_size)              { (void)buf; (void)buf_size; return 0; }
+void  import_link_keys(const unsigned char *buf, int len)             { (void)buf; (void)len; }
+unsigned char get_player_leds(void)                                    { return 0; }

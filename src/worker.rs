@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+
 use crate::btstack;
 use crate::ipc::{WorkerCommand, WorkerEvent};
 
@@ -31,7 +33,7 @@ pub fn run(args: &[String]) {
     let pid = u16::from_str_radix(&args[4], 16).unwrap_or(0);
     let instance: i32 = args[5].parse().unwrap_or(0);
 
-    eprintln!("[worker] 起動: vid={vid:04x} pid={pid:04x} instance={instance}");
+    eprintln!("[worker:{vid:04x}:{pid:04x}] 起動 instance={instance}");
 
     // ペアリングループ中かどうか
     let syncing = Arc::new(AtomicBool::new(false));
@@ -59,12 +61,28 @@ pub fn run(args: &[String]) {
         .name("worker-status".into())
         .spawn(move || {
             let stdout = io::stdout();
+            let mut prev_paired = false;
             loop {
                 std::thread::sleep(Duration::from_millis(100));
+                let paired = btstack::is_paired();
+                let is_syncing = syncing_status.load(Ordering::Relaxed);
+
+                // ペアリング成功検出: paired になったらシンクループを停止し、リンクキーを送信
+                if paired && !prev_paired {
+                    if is_syncing {
+                        syncing_status.store(false, Ordering::Relaxed);
+                        eprintln!("[worker] status: paired detected, stopping sync loop");
+                    }
+                    // リンクキーを送信（ペアリング成功時）
+                    send_link_keys();
+                }
+                prev_paired = paired;
+
                 let event = WorkerEvent::Status {
-                    paired: btstack::is_paired(),
+                    paired,
                     rumble: btstack::get_rumble_state(),
                     syncing: syncing_status.load(Ordering::Relaxed),
+                    player: btstack::get_player_number(),
                 };
                 let mut line = serde_json::to_string(&event).unwrap_or_default();
                 line.push('\n');
@@ -109,17 +127,35 @@ fn handle_command(cmd: WorkerCommand, syncing: &Arc<AtomicBool>) {
         WorkerCommand::PadColor { pad, btn, lg, rg } => btstack::set_pad_color(pad, btn, lg, rg),
         WorkerCommand::RumbleRegister { key } => btstack::rumble_register(key),
         WorkerCommand::Amiibo { path } => btstack::send_amiibo(&path),
-        WorkerCommand::Reconnect => {
-            eprintln!("[worker] 再接続シグナルを送信");
+        WorkerCommand::SetLinkKeys { data } => {
+            match base64::engine::general_purpose::STANDARD.decode(&data) {
+                Ok(bytes) => btstack::set_link_keys(&bytes),
+                Err(e) => eprintln!("[worker] link key decode error: {e}"),
+            }
+        }
+        WorkerCommand::GetLinkKeys => {
+            send_link_keys();
+        }
+        WorkerCommand::Reconnect { link_keys } => {
+            if let Some(data) = link_keys {
+                match base64::engine::general_purpose::STANDARD.decode(&data) {
+                    Ok(bytes) => {
+                        btstack::set_link_keys(&bytes);
+                        eprintln!("[worker] reconnect (imported link keys)");
+                    }
+                    Err(e) => eprintln!("[worker] reconnect link key decode error: {e}"),
+                }
+            } else {
+                eprintln!("[worker] reconnect (no link keys)");
+            }
             btstack::reconnect();
         }
         WorkerCommand::Sync => {
-            eprintln!("[worker] シンクロ（リンクキー削除 + HCI リセット）");
+            eprintln!("[worker] sync (delete link keys + HCI reset)");
             btstack::sync();
         }
         WorkerCommand::SyncStart => {
             if syncing.load(Ordering::Relaxed) {
-                eprintln!("[worker] ペアリングループは既に実行中");
                 return;
             }
             syncing.store(true, Ordering::Relaxed);
@@ -127,40 +163,35 @@ fn handle_command(cmd: WorkerCommand, syncing: &Arc<AtomicBool>) {
             std::thread::Builder::new()
                 .name("sync-loop".into())
                 .spawn(move || {
-                    eprintln!("[worker] ペアリングループ開始: sync_gamepad() を呼び出します");
-                    // リンクキー削除 + HCI リセット → discoverable モードに入る
-                    // HCI OFF→ON 後、gap_discoverable_control(1) が自動で呼ばれる（パッチ済み）
+                    eprintln!("[worker] pairing: start");
                     btstack::sync();
-                    eprintln!("[worker] sync_gamepad() 呼び出し完了、discoverable 待機開始");
+                    eprintln!("[worker] pairing: discoverable, waiting for Switch...");
 
-                    // discoverable を維持したまま接続を待つ。
-                    // 実機の Pro Controller と同様、HCI を再リセットせずに待機する。
-                    // Switch が発見→接続→ペアリングハンドシェイク完了まで
-                    // 数秒〜数十秒かかることがある。
                     let mut tick = 0u32;
                     loop {
                         std::thread::sleep(Duration::from_millis(200));
                         if !syncing_loop.load(Ordering::Relaxed) {
-                            eprintln!("[worker] ペアリングループ中断 (tick={tick})");
+                            eprintln!("[worker] pairing: cancelled");
                             return;
                         }
-                        let paired = btstack::is_paired();
-                        if tick % 25 == 0 {
-                            // 5秒ごとにステータスログ
-                            eprintln!("[worker] ペアリング待機中: tick={tick} paired={paired}");
-                        }
-                        if paired {
-                            eprintln!("[worker] ペアリング成功！ループ終了 (tick={tick})");
+                        if btstack::is_paired() {
+                            eprintln!("[worker] pairing: success! ({:.1}s)", tick as f64 * 0.2);
                             syncing_loop.store(false, Ordering::Relaxed);
+                            // ペアリング成功時にリンクキーを送信（ブラウザが IndexedDB に保存）
+                            send_link_keys();
                             return;
+                        }
+                        // 10秒ごとにログ
+                        if tick % 50 == 0 && tick > 0 {
+                            eprintln!("[worker] pairing: waiting... ({:.0}s)", tick as f64 * 0.2);
                         }
                         tick += 1;
                     }
                 })
-                .expect("ペアリングループスレッドの生成に失敗");
+                .expect("sync-loop thread spawn failed");
         }
         WorkerCommand::SyncStop => {
-            eprintln!("[worker] ペアリングループ停止");
+            eprintln!("[worker] pairing: stop");
             syncing.store(false, Ordering::Relaxed);
         }
         WorkerCommand::Shutdown => {
@@ -179,4 +210,13 @@ fn send_event(event: &WorkerEvent) {
     let mut lock = stdout.lock();
     let _ = lock.write_all(line.as_bytes());
     let _ = lock.flush();
+}
+
+fn send_link_keys() {
+    let keys = btstack::get_link_keys();
+    if keys.is_empty() {
+        return;
+    }
+    let data = base64::engine::general_purpose::STANDARD.encode(&keys);
+    send_event(&WorkerEvent::LinkKeys { data });
 }

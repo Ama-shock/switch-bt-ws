@@ -24,7 +24,6 @@
 
 #include "btstack_config.h"
 
-#include "ble/le_device_db_tlv.h"
 #include "btstack_audio.h"
 #include "btstack_debug.h"
 #include "btstack_event.h"
@@ -33,8 +32,10 @@
 #include "btstack_run_loop_windows.h"
 #include "btstack_stdin.h"
 #include "btstack_stdin_windows.h"
+#include "classic/btstack_link_key_db_memory.h"
+#include "btstack_tlv.h"
 #include "btstack_tlv_windows.h"
-#include "classic/btstack_link_key_db_tlv.h"
+#include "ble/le_device_db_tlv.h"
 #include "hal_led.h"
 #include "hci.h"
 #include "hci_dump.h"
@@ -47,22 +48,19 @@ int btstack_main(int argc, const char * argv[]);
 
 static btstack_packet_callback_registration_t hci_event_callback_registration;
 
-/* TLV リンクキーデータベースのファイル名プレフィックス / サフィックス */
-#define TLV_DB_PATH_PREFIX  "btstack_"
-#define TLV_DB_PATH_POSTFIX ".tlv"
-
-static char                  tlv_db_path[100];
-static const btstack_tlv_t * tlv_impl;
-static btstack_tlv_windows_t tlv_context;
 static bd_addr_t             local_addr;
 static bool                  shutdown_triggered;
+
+/* TLV インスタンス（LE device DB 用） */
+static const btstack_tlv_t             *btstack_tlv_impl;
+static btstack_tlv_windows_t            btstack_tlv_context;
 
 /* ---------------------------------------------------------------------- */
 /* 内部ヘルパー                                                             */
 /* ---------------------------------------------------------------------- */
 
 /* BTStack の状態変化イベントを処理する。
- * HCI_STATE_WORKING 時に TLV データベースを初期化し、
+ * HCI_STATE_WORKING 時にメモリ内リンクキー DB を設定し、
  * HCI_STATE_OFF 時にクリーンアップを行う。 */
 static void packet_handler(uint8_t packet_type, uint16_t channel,
                             uint8_t *packet, uint16_t size)
@@ -76,31 +74,24 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     switch (btstack_event_state_get_state(packet)) {
         case HCI_STATE_WORKING:
             gap_local_bd_addr(local_addr);
-            fprintf(stderr, "[btstack] 動作中: BD_ADDR=%s\n", bd_addr_to_str(local_addr));
+            fprintf(stderr, "[btstack] HCI working: BD_ADDR=%s\n", bd_addr_to_str(local_addr));
 
-            /* ローカル BD アドレスを使った TLV パスを構築 */
-            btstack_strcpy(tlv_db_path, sizeof(tlv_db_path), TLV_DB_PATH_PREFIX);
-            btstack_strcat(tlv_db_path, sizeof(tlv_db_path),
-                           bd_addr_to_str_with_delimiter(local_addr, '-'));
-            btstack_strcat(tlv_db_path, sizeof(tlv_db_path), TLV_DB_PATH_POSTFIX);
-
-            tlv_impl = btstack_tlv_windows_init_instance(&tlv_context, tlv_db_path);
-            btstack_tlv_set_instance(tlv_impl, &tlv_context);
+            /* TLV ストレージを初期化（LE device DB が内部で使用）
+             * ファイルパスに NUL を指定してディスク書き出しを無効化 */
+            btstack_tlv_impl = btstack_tlv_windows_init_instance(
+                &btstack_tlv_context, "NUL");
+            btstack_tlv_set_instance(btstack_tlv_impl, &btstack_tlv_context);
 #ifdef ENABLE_CLASSIC
-            hci_set_link_key_db(
-                btstack_link_key_db_tlv_get_instance(tlv_impl, &tlv_context));
+            /* クラシック BT リンクキーはメモリ上のみで管理（ファイル不要） */
+            hci_set_link_key_db(btstack_link_key_db_memory_instance());
 #endif
-#ifdef ENABLE_BLE
-            le_device_db_tlv_configure(tlv_impl, &tlv_context);
-#endif
+            le_device_db_tlv_configure(btstack_tlv_impl, &btstack_tlv_context);
             break;
 
         case HCI_STATE_OFF:
-            btstack_tlv_windows_deinit(&tlv_context);
             if (!shutdown_triggered) break;
             btstack_stdin_reset();
-            log_info("BTStack が正常にシャットダウンしました。");
-            /* この後ランループが返り、btstack_platform_run() が終了する */
+            log_info("BTStack shutdown complete");
             break;
 
         default:
@@ -111,8 +102,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
 /* シャットダウンを開始する。CTRL-C ハンドラおよび shutdown_gamepad() から呼ばれる。 */
 static void trigger_shutdown(void)
 {
-    fprintf(stderr, "[btstack] シャットダウン要求を受け付けました。\n");
-    log_info("trigger_shutdown: HCI 電源オフを要求");
+    fprintf(stderr, "[btstack] shutdown requested\n");
     shutdown_triggered = true;
     hci_power_control(HCI_POWER_OFF);
 }
@@ -133,7 +123,7 @@ static void btstack_platform_run(void)
     /* ログ行がすぐに表示されるよう標準出力のバッファリングを無効化 */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    fprintf(stderr, "[btstack] switch-bt-ws プラットフォーム起動\n");
+    fprintf(stderr, "[btstack] platform starting\n");
 
     /* コア初期化 */
     btstack_memory_init();
@@ -142,7 +132,7 @@ static void btstack_platform_run(void)
     /* USB HCI トランスポート（WinUSB ドングル） */
     hci_init(hci_transport_usb_instance(), NULL);
 
-    /* 状態通知ハンドラを登録（TLV 初期化・シャットダウン処理用） */
+    /* 状態通知ハンドラを登録 */
     hci_event_callback_registration.callback = &packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
 
@@ -171,4 +161,51 @@ void start_gamepad(void)
 void shutdown_gamepad(void)
 {
     trigger_shutdown();
+}
+
+/*
+ * リンクキーのエクスポート。
+ * 各エントリ: BD_ADDR(6) + link_key(16) + key_type(1) = 23 バイト。
+ * buf にエントリを連結して書き込み、書き込んだバイト数を返す。
+ */
+int export_link_keys(uint8_t *buf, int buf_size)
+{
+    const btstack_link_key_db_t *db = btstack_link_key_db_memory_instance();
+    btstack_link_key_iterator_t it;
+    int offset = 0;
+
+    if (!db->iterator_init(&it)) return 0;
+
+    bd_addr_t addr;
+    link_key_t key;
+    link_key_type_t type;
+    while (db->iterator_get_next(&it, addr, key, &type)) {
+        if (offset + 23 > buf_size) break;
+        memcpy(buf + offset, addr, 6);
+        memcpy(buf + offset + 6, key, 16);
+        buf[offset + 22] = (uint8_t)type;
+        offset += 23;
+    }
+    db->iterator_done(&it);
+    return offset;
+}
+
+/*
+ * リンクキーのインポート。
+ * export_link_keys と同じフォーマット（23 バイト/エントリ）を受け取る。
+ */
+void import_link_keys(const uint8_t *buf, int len)
+{
+    const btstack_link_key_db_t *db = btstack_link_key_db_memory_instance();
+    int count = 0;
+    for (int i = 0; i + 23 <= len; i += 23) {
+        bd_addr_t addr;
+        link_key_t key;
+        memcpy(addr, buf + i, 6);
+        memcpy(key, buf + i + 6, 16);
+        link_key_type_t type = (link_key_type_t)buf[i + 22];
+        db->put_link_key(addr, key, type);
+        count++;
+    }
+    fprintf(stderr, "[btstack] imported %d link key(s)\n", count);
 }

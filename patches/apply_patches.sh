@@ -303,17 +303,8 @@ if ! grep -q 'fprintf.*stderr.*HID_CONNECTION_OPENED' "$BTKEYLIB_C"; then
         print "                                fprintf(stderr, \"[btkeyLib] >>> PAIRED! pairing_state=%d hid_cid=%d\\n\", pairing_state, hid_cid);"
         next
     }
-    # HCI_EVENT_HID_META の switch 文の直前にサブイベントコードログ追加
-    /hci_event_hid_meta_get_subevent_code/ {
-        print "                fprintf(stderr, \"[btkeyLib] HID_META: subevent=0x%02x\\n\", hci_event_hid_meta_get_subevent_code(packet));"
-    }
-    # btstack_main 内の hci_power_control(HCI_POWER_ON) の直後にログ
-    /hci_power_control\(HCI_POWER_ON\)/ && !added_main_log {
-        print $0
-        print "    fprintf(stderr, \"[btkeyLib] btstack_main: initialized, HCI_POWER_ON requested\\n\");"
-        added_main_log = 1
-        next
-    }
+    # HCI_EVENT_HID_META: subevent ログは --debug 時のみ有用なので削除
+    # btstack_main の HCI_POWER_ON ログは不要（HCI_STATE_WORKING ハンドラでログ済み）
     { print }
     ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
     mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
@@ -356,20 +347,8 @@ if ! grep -q 'gap_ssp_set_io_capability' "$BTKEYLIB_C"; then
     echo "[patch] btkeyLib.c: SSP Just Works + bondable モードを設定"
 fi
 
-# ---------------------------------------------------------------------------
-# パッチ 9: nintendo_packet_handler の冒頭に HCI イベントログ追加
-# ---------------------------------------------------------------------------
-# すべての HCI イベントタイプをログに出力する。
-# これにより、Switch からの接続試行（HCI_EVENT_CONNECTION_REQUEST=0x04 等）を検出できる。
-# 注意: if() の直後の { の中に挿入しないと if 文の構造が壊れる。
-if ! grep -q 'fprintf.*stderr.*pkt:' "$BTKEYLIB_C"; then
-    # "uint8_t status;" の直後に、ノイズの多いイベントを除外したログを挿入
-    # 除外: 0x6e(BTStack内部), 0x13(CompletedPackets), 0x0e(CmdComplete), 0x0f(CmdStatus)
-    sed -i '/^static void nintendo_packet_handler/,/uint8_t status;/ {
-        /uint8_t status;/a\    if (packet_type == 4 && packet[0] != 0x6e && packet[0] != 0x13 && packet[0] != 0x0e && packet[0] != 0x0f) {\n        fprintf(stderr, "[btkeyLib] pkt: evt=0x%02x size=%d\\n", packet[0], packet_size);\n    }
-    }' "$BTKEYLIB_C"
-    echo "[patch] btkeyLib.c: HCI イベントデバッグログを追加（フィルタ付き）"
-fi
+# パッチ 9 は削除済み（HCI パケットログは冗長すぎるため）
+# --debug フラグ使用時のみ詳細ログが必要な場合は、別途有効化すること。
 
 # ---------------------------------------------------------------------------
 # パッチ 10: do_sync_on_main で gap_discoverable + gap_connectable を明示的に呼ぶ
@@ -382,6 +361,102 @@ if ! grep -q 'gap_discoverable_control.*do_sync' "$BTKEYLIB_C"; then
         /hci_power_control(HCI_POWER_ON);/a\    /* switch-bt-ws patch: sync 後に明示的に discoverable + connectable 再設定 */\n    fprintf(stderr, "[btkeyLib] do_sync: HCI OFF->ON queued, waiting for HCI_STATE_WORKING...\\n");
     }' "$BTKEYLIB_C"
     echo "[patch] btkeyLib.c: do_sync_on_main にログを追加"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 11: hid_report_data_callback にデバッグログを追加
+# ---------------------------------------------------------------------------
+# Switch からの HID レポートが到着しているかを確認するためのログ。
+if ! grep -q 'fprintf.*stderr.*hid_report_data_callback.*report_id' "$BTKEYLIB_C"; then
+    sed -i '/^static void hid_report_data_callback.*report_size.*report)/{
+        N
+        s/$/\n    fprintf(stderr, "[btkeyLib] hid_report: id=%d size=%d r9=0x%02x r10=0x%02x ps=%d\\n", report_id, report_size, report_size > 9 ? report[9] : 0, report_size > 10 ? report[10] : 0, pairing_state);/
+    }' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: hid_report_data_callback にデバッグログを追加"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 12: CAN_SEND_NOW にデバッグログ（初回のみ）
+# ---------------------------------------------------------------------------
+if ! grep -q 'fprintf.*stderr.*CAN_SEND_NOW.*pairing_state' "$BTKEYLIB_C"; then
+    awk '
+    /case HID_SUBEVENT_CAN_SEND_NOW:/ && !patched_csn {
+        print $0
+        print "                    {"
+        print "                        static int csn_log_count = 0;"
+        print "                        if (csn_log_count < 5) {"
+        print "                            fprintf(stderr, \"[btkeyLib] CAN_SEND_NOW: pairing_state=%d hid_cid=%d\\n\", pairing_state, hid_cid);"
+        print "                            csn_log_count++;"
+        print "                        }"
+        print "                    }"
+        patched_csn = 1
+        next
+    }
+    { print }
+    ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
+    mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: CAN_SEND_NOW にデバッグログを追加"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 13: pairing_state==15 でも paired=true にする
+# ---------------------------------------------------------------------------
+# Switch のレポート到着順序により、pairing_state が 14 を経由せず 15 に到達する
+# 場合がある。state 15 は state 14 以降の後処理状態であり、ここに到達した時点で
+# ペアリングハンドシェイクは実質完了している。
+# CAN_SEND_NOW 内の else if (paired && (pairing_state == 13 || pairing_state == 15))
+# を修正して、paired でなくても state 15 で paired = true にする。
+if ! grep -q 'switch-bt-ws patch: state 15 also sets paired' "$BTKEYLIB_C"; then
+    awk '
+    /else if \(paired && \(pairing_state == 13 \|\| pairing_state == 15\)\)/ && !patched_s15 {
+        print "                            /* switch-bt-ws patch: state 15 also sets paired */"
+        print "                            else if (pairing_state == 15)"
+        print "                            {"
+        print "                                pairing_state = 0;"
+        print "                                if (!paired) {"
+        print "                                    joy.timer = tim+1;"
+        print "                                    paired = true;"
+        print "                                    fprintf(stderr, \"[btkeyLib] >>> PAIRED (via state 15)! hid_cid=%d\\n\", hid_cid);"
+        print "                                }"
+        print "                            }"
+        print "                            else if (paired && pairing_state == 13)"
+        print "                            {"
+        print "                                pairing_state = 0;"
+        print "                            }"
+        patched_s15 = 1
+        next
+    }
+    { print }
+    ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
+    mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: pairing_state==15 でも paired=true を設定"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 14: Switch が割り当てた player LED を取得する関数を追加
+# ---------------------------------------------------------------------------
+# Switch はサブコマンド 0x30 でプレイヤー LED を設定する。
+# report[9]==0x30 の時、report[10] が LED ビットパターン:
+#   P1=0x01, P2=0x03, P3=0x07, P4=0x0F（累積パターン）
+# この値を保持し、get_player_leds() で取得できるようにする。
+if ! grep -q 'player_leds' "$BTKEYLIB_C"; then
+    # 1. グローバル変数を paired の直後に追加
+    sed -i '/^bool paired = false;/a\uint8_t player_leds = 0;  /* switch-bt-ws patch: Switch assigned player LED pattern */' "$BTKEYLIB_C"
+
+    # 2. hid_report_data_callback 内で report[9]==0x30 の時に player_leds をキャプチャ
+    #    pairing_state = 14 の条件（report_id==1 && report[9]==48 && report[10]==1）の直前に挿入
+    sed -i '/report_id == 1 && report\[9\] == 48 && report\[10\] == 1/{
+        i\    if(report[9] == 48) { player_leds = report[10]; }  /* switch-bt-ws patch: capture player LED */
+    }' "$BTKEYLIB_C"
+
+    # 3. gamepad_paired() の直後に get_player_leds() を追加
+    sed -i '/^bool EXPORT_API gamepad_paired()/{
+        N
+        N
+        a\uint8_t EXPORT_API get_player_leds()\n{\n    return player_leds;\n}
+    }' "$BTKEYLIB_C"
+
+    echo "[patch] btkeyLib.c: player_leds グローバル変数と get_player_leds() を追加"
 fi
 
 echo "[patch] 全パッチの適用が完了しました。"

@@ -99,9 +99,9 @@ fn compile_btstack() {
     ];
 
     // 不要なファイルを除外する
-    // - le_device_db_memory.c  : TLV 版を使うため不要
+    // - le_device_db_memory.c     : TLV 版を使用（BLE LE device DB 用）
     // - btstack_audio_portaudio.c : PortAudio 依存のため除外
-    // - sco_demo_util.c        : デモ用音声処理、btkeyLib には不要
+    // - sco_demo_util.c           : デモ用音声処理、btkeyLib には不要
     let exclude: &[&str] = &[
         "le_device_db_memory.c",
         "btstack_audio_portaudio.c",
