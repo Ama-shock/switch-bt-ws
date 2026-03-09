@@ -45,14 +45,18 @@ pub struct BtUsbDevice {
 mod platform {
     use super::*;
 
-    /// INF ファイルを保存するディレクトリ
-    const INF_DIR: &str = r"C:\Windows\Temp";
+    /// ドライバパッケージを保存するベースディレクトリ
+    const DRIVER_BASE_DIR: &str = r"C:\Windows\Temp\btstack_drivers";
 
     fn inf_name(vid: u16, pid: u16) -> String {
         format!("btstack_{vid:04x}_{pid:04x}.inf")
     }
-    fn inf_path(vid: u16, pid: u16) -> String {
-        format!(r"{INF_DIR}\{}", inf_name(vid, pid))
+    fn cat_name(vid: u16, pid: u16) -> String {
+        format!("btstack_{vid:04x}_{pid:04x}.cat")
+    }
+    /// INF + .cat を格納する VID/PID 別ディレクトリ
+    fn driver_package_dir(vid: u16, pid: u16) -> String {
+        format!(r"{DRIVER_BASE_DIR}\{vid:04x}_{pid:04x}")
     }
 
     // ---- デバイス一覧 -------------------------------------------------------
@@ -172,25 +176,73 @@ Get-WmiObject Win32_PnPEntity |
     // ---- WinUSB ドライバ導入 -----------------------------------------------
 
     /// 指定した VID/PID の USB デバイスに WinUSB ドライバを導入する。
-    /// INF ファイルを生成し `UpdateDriverForPlugAndPlayDevicesW` (newdev.dll) で
-    /// デバイスのドライバを強制更新します。
-    /// pnputil は署名なし INF を拒否するため、Win32 API を直接使用します。
-    /// 署名なしドライバの場合、Windows が信頼確認ダイアログを表示します。
+    ///
+    /// 手順（Zadig / libwdi と同等）:
+    /// 1. INF + CatalogFile を書き出す
+    /// 2. 自己署名コード署名証明書を作成（既存なら再利用）
+    /// 3. 証明書を Root + TrustedPublisher ストアに追加
+    /// 4. `New-FileCatalog` で .cat ファイルを生成
+    /// 5. `Set-AuthenticodeSignature` で .cat に署名
+    /// 6. `UpdateDriverForPlugAndPlayDevicesW` でデバイスのドライバを更新
+    ///
     /// 管理者権限が必要です。
     pub async fn install_winusb(vid: u16, pid: u16) -> Result<String> {
-        let inf_path = inf_path(vid, pid);
+        let dir = driver_package_dir(vid, pid);
+        let inf = inf_name(vid, pid);
+        let cat = cat_name(vid, pid);
 
-        // WinUSB 用 INF ファイルを書き出す
-        write_winusb_inf(vid, pid, &inf_path)?;
+        // ドライバパッケージディレクトリを作成し INF を書き出す
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("ディレクトリの作成に失敗しました: {dir}"))?;
+        let inf_full = format!(r"{dir}\{inf}");
+        write_winusb_inf(vid, pid, &inf_full)?;
 
-        let hwid = format!("USB\\\\VID_{vid:04X}&PID_{pid:04X}");
+        let hwid = format!(r"USB\VID_{vid:04X}&PID_{pid:04X}");
 
-        // PowerShell 経由で UpdateDriverForPlugAndPlayDevicesW を P/Invoke 呼び出し。
-        // この API は HWID を指定して該当デバイスのドライバを直接更新する。
-        // DiInstallDriverW はドライバストアへの追加のみで既存デバイスを
-        // 更新しないことがあるため、こちらを使用する。
+        // PowerShell スクリプト:
+        //   自己署名証明書 → カタログ作成・署名 → UpdateDriverForPlugAndPlayDevices
         let ps_script = format!(
             r#"
+$ErrorActionPreference = 'Stop'
+$certSubject = 'CN=switch-bt-ws WinUSB Driver'
+$dir = '{dir}'
+$infFile = '{inf}'
+$catFile = '{cat}'
+$hwid = '{hwid}'
+
+# --- 1. 自己署名コード署名証明書 (既存なら再利用) ---
+$cert = Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert |
+    Where-Object {{ $_.Subject -eq $certSubject -and $_.NotAfter -gt (Get-Date) }} |
+    Select-Object -First 1
+if (-not $cert) {{
+    $cert = New-SelfSignedCertificate `
+        -Subject $certSubject `
+        -Type CodeSigningCert `
+        -CertStoreLocation Cert:\LocalMachine\My `
+        -NotAfter (Get-Date).AddYears(10)
+}}
+
+# --- 2. Root + TrustedPublisher に追加（既にあればスキップ） ---
+$thumb = $cert.Thumbprint
+foreach ($store in @('Root', 'TrustedPublisher')) {{
+    $existing = Get-ChildItem "Cert:\LocalMachine\$store" |
+        Where-Object {{ $_.Thumbprint -eq $thumb }}
+    if (-not $existing) {{
+        $tmpCer = [System.IO.Path]::GetTempFileName() + '.cer'
+        Export-Certificate -Cert $cert -FilePath $tmpCer -Type CERT | Out-Null
+        Import-Certificate -FilePath $tmpCer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
+        Remove-Item $tmpCer -ErrorAction SilentlyContinue
+    }}
+}}
+
+# --- 3. カタログファイル (.cat) を作成 ---
+$catPath = Join-Path $dir $catFile
+New-FileCatalog -Path $dir -CatalogFilePath $catPath -CatalogVersion 2.0 | Out-Null
+
+# --- 4. カタログに署名 ---
+Set-AuthenticodeSignature -FilePath $catPath -Certificate $cert -HashAlgorithm SHA256 | Out-Null
+
+# --- 5. UpdateDriverForPlugAndPlayDevicesW でドライバ適用 ---
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -205,35 +257,32 @@ public class WinUsbInstaller {{
         uint InstallFlags,
         out bool bRebootRequired
     );
-
-    public static void Install(string hwid, string infPath) {{
-        bool needReboot = false;
-        // INSTALLFLAG_FORCE = 0x01 : 現在のドライバより低ランクでも強制適用
-        bool result = UpdateDriverForPlugAndPlayDevicesW(
-            IntPtr.Zero, hwid, infPath, 0x01, out needReboot);
-        if (!result) {{
-            int err = Marshal.GetLastWin32Error();
-            throw new Win32Exception(err);
-        }}
-        if (needReboot) {{
-            Console.WriteLine("REBOOT_REQUIRED");
-        }}
-    }}
 }}
 "@
 
-[WinUsbInstaller]::Install("{hwid}", "{inf_path}")
-Write-Output "OK"
+$infPath = Join-Path $dir $infFile
+$reboot = $false
+$result = [WinUsbInstaller]::UpdateDriverForPlugAndPlayDevicesW(
+    [IntPtr]::Zero, $hwid, $infPath, 0x01, [ref]$reboot)
+if (-not $result) {{
+    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    $ex = New-Object System.ComponentModel.Win32Exception($err)
+    throw "UpdateDriver failed ($err): $($ex.Message)"
+}}
+if ($reboot) {{ Write-Output 'REBOOT_REQUIRED' }}
+Write-Output 'OK'
 "#,
+            dir = dir.replace('\'', "''"),
+            inf = inf,
+            cat = cat,
             hwid = hwid,
-            inf_path = inf_path.replace('\\', "\\\\"),
         );
 
         let output = tokio::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
             .output()
             .await
-            .context("UpdateDriverForPlugAndPlayDevicesW の実行に失敗しました")?;
+            .context("WinUSB ドライバ導入スクリプトの実行に失敗しました")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -255,16 +304,18 @@ Write-Output "OK"
         }
     }
 
-    /// WinUSB 用の最小限の INF ファイルを生成する。
-    /// Zadig / libwdi が生成するものと同等の内容です。
+    /// WinUSB 用の INF ファイルを生成する（Zadig / libwdi 互換）。
+    /// CatalogFile を含めることで署名済みカタログと紐づく。
     fn write_winusb_inf(vid: u16, pid: u16, path: &str) -> Result<()> {
+        let cat = cat_name(vid, pid);
         let inf = format!(
             r#"[Version]
 Signature   = "$Windows NT$"
-Class       = "USBDevice"
+Class       = USBDevice
 ClassGUID   = {{88BAE032-5A81-49f0-BC3D-A4FF138216D6}}
 Provider    = %ProviderName%
-DriverVer   = 06/21/2006,6.1.7600.16385
+CatalogFile = {cat}
+DriverVer   = 01/01/2024,1.0.0.0
 
 [ClassInstall32]
 AddReg = WinUSBDeviceClassReg
@@ -312,6 +363,7 @@ ClassName      = "USB Devices"
 DeviceName     = "Bluetooth Dongle (WinUSB)"
 WinUSB_SvcDesc = "WinUSB"
 "#,
+            cat = cat,
             vid = vid,
             pid = pid,
         );
@@ -325,59 +377,119 @@ WinUSB_SvcDesc = "WinUSB"
 
     /// WinUSB ドライバを削除し、元の Bluetooth ドライバに戻す。
     ///
-    /// 戦略 1: `pnputil /delete-driver /uninstall /force` で INF を削除する。
-    /// 戦略 2: `devcon update` で直接 BthUsb ドライバを適用する（ベストエフォート）。
+    /// PowerShell で以下を実行:
+    /// 1. ドライバストアから switch-bt-ws の OEM INF を検索
+    /// 2. `pnputil /delete-driver /uninstall /force` で削除
+    /// 3. デバイスを無効→有効にして Windows に標準ドライバを再適用させる
+    /// 4. パッケージディレクトリを削除
+    ///
+    /// 管理者権限が必要です。
     pub async fn restore_driver(vid: u16, pid: u16) -> Result<String> {
-        let inf = inf_name(vid, pid);
+        let hwid = format!(r"USB\VID_{vid:04X}&PID_{pid:04X}");
+        let dir = driver_package_dir(vid, pid);
+        let inf_original = inf_name(vid, pid);
+        let vid_hex = format!("{vid:04X}");
+        let pid_hex = format!("{pid:04X}");
 
-        // まず pnputil でドライバストアから INF を削除する
-        let del = tokio::process::Command::new("pnputil")
-            .args(["/delete-driver", &inf, "/uninstall", "/force"])
+        let ps_script = format!(
+            r#"
+$ErrorActionPreference = 'Stop'
+$hwid = '{hwid}'
+$infOriginal = '{inf_original}'
+$vidPidPattern = 'VID_{vid_hex}&PID_{pid_hex}'
+
+# --- 1. ドライバストアから該当 OEM INF を探す ---
+# pnputil /enum-drivers は JSON 未対応なので WMI で代替
+$oemInf = $null
+$drivers = Get-WmiObject Win32_PnPSignedDriver |
+    Where-Object {{ $_.InfName -match '^oem\d+\.inf$' -and $_.DeviceID -match $vidPidPattern }}
+if ($drivers) {{
+    $first = @($drivers)[0]
+    $oemInf = $first.InfName
+    Write-Host "Found OEM INF: $oemInf"
+}}
+
+# WMI で見つからない場合は pnputil テキスト解析にフォールバック
+if (-not $oemInf) {{
+    $output = pnputil /enum-drivers 2>&1 | Out-String
+    $blocks = $output -split '(?=Published Name)' | Where-Object {{ $_.Trim() }}
+    foreach ($block in $blocks) {{
+        if ($block -match 'switch-bt-ws' -or $block -match $infOriginal) {{
+            if ($block -match 'Published Name\s*:\s*(oem\d+\.inf)') {{
+                $oemInf = $Matches[1]
+                Write-Host "Found OEM INF (pnputil): $oemInf"
+                break
+            }}
+        }}
+    }}
+}}
+
+# --- 2. OEM INF を削除 ---
+if ($oemInf) {{
+    $delResult = pnputil /delete-driver $oemInf /uninstall /force 2>&1 | Out-String
+    Write-Host "pnputil delete: $delResult"
+}} else {{
+    Write-Host "OEM INF not found in driver store, skipping delete"
+}}
+
+# --- 3. デバイスを無効→有効にして OS に標準ドライバを再割り当てさせる ---
+$dev = Get-PnpDevice | Where-Object {{ $_.InstanceId -match $vidPidPattern }}
+if ($dev) {{
+    $instId = $dev.InstanceId
+    Write-Host "Restarting device: $instId"
+    Disable-PnpDevice -InstanceId $instId -Confirm:$false -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Enable-PnpDevice -InstanceId $instId -Confirm:$false -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    # 結果確認
+    $updated = Get-PnpDevice -InstanceId $instId -ErrorAction SilentlyContinue
+    $svc = (Get-PnpDeviceProperty -InstanceId $instId -KeyName DEVPKEY_Device_Service -ErrorAction SilentlyContinue).Data
+    Write-Host "Device service after restore: $svc"
+}} else {{
+    # デバイスが見つからない場合はハードウェアスキャンを実行
+    pnputil /scan-devices 2>&1 | Out-String | Write-Host
+}}
+
+# --- 4. パッケージディレクトリを削除 ---
+$dir = '{dir}'
+if (Test-Path $dir) {{
+    Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+}}
+
+Write-Output 'OK'
+"#,
+            hwid = hwid,
+            inf_original = inf_original,
+            vid_hex = vid_hex,
+            pid_hex = pid_hex,
+            dir = dir.replace('\'', "''"),
+        );
+
+        let output = tokio::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
             .output()
-            .await;
+            .await
+            .context("ドライバ復元スクリプトの実行に失敗しました")?;
 
-        match del {
-            Ok(out) if out.status.success() => {
-                let msg = format!("WinUSB ドライバを削除しました ({vid:04x}:{pid:04x})");
-                tracing::info!("{msg}");
-                // さらに devcon で即時ドライバ更新を試みる（ベストエフォート）
-                update_via_devcon(vid, pid).await;
-                return Ok(msg);
-            }
-            _ => {
-                tracing::warn!("pnputil /delete-driver 失敗。devcon を試みます");
-            }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        tracing::info!("restore stdout: {stdout}");
+        if !stderr.trim().is_empty() {
+            tracing::warn!("restore stderr: {stderr}");
         }
 
-        // pnputil が失敗した場合は devcon で直接適用を試みる
-        update_via_devcon(vid, pid).await;
-        Ok(format!(
-            "{vid:04x}:{pid:04x} のドライバ復元を試みました（デバイスマネージャーで確認してください）"
-        ))
-    }
-
-    /// devcon.exe を使って Windows 標準 Bluetooth ドライバを適用する。
-    /// devcon は WDK / Windows SDK に含まれているため、
-    /// インストールされていない環境では警告のみを出してスキップします。
-    async fn update_via_devcon(vid: u16, pid: u16) {
-        let hwid = format!("USB\\VID_{:04X}&PID_{:04X}", vid, pid);
-        let result = tokio::process::Command::new("devcon")
-            .args(["update", r"C:\Windows\INF\bth.inf", &hwid])
-            .output()
-            .await;
-        match result {
-            Ok(out) if out.status.success() => {
-                tracing::info!("devcon update 成功: {hwid}");
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::warn!("devcon update 失敗 ({hwid}): {stderr}");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "devcon が見つからないか実行できません ({e})。手動でドライバを復元してください"
-                );
-            }
+        if output.status.success() && stdout.contains("OK") {
+            let msg = format!("ドライバを復元しました ({vid:04x}:{pid:04x})");
+            tracing::info!("{msg}");
+            Ok(msg)
+        } else {
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim().to_string()
+            } else {
+                stdout.trim().to_string()
+            };
+            Err(anyhow::anyhow!("ドライバの復元に失敗しました: {detail}"))
         }
     }
 }

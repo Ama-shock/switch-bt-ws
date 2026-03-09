@@ -145,6 +145,11 @@ fn compile_btstack() {
     build.compile("btstack_gamepad");
 
     // -----------------------------------------------------------------------
+    // UAC マニフェスト埋め込み（管理者権限を要求する）
+    // -----------------------------------------------------------------------
+    compile_manifest();
+
+    // -----------------------------------------------------------------------
     // リンカーフラグ（BTStack WinUSB が必要とする Windows 標準ライブラリ）
     // -----------------------------------------------------------------------
     println!("cargo:rustc-link-lib=winusb");
@@ -155,11 +160,43 @@ fn compile_btstack() {
     // -----------------------------------------------------------------------
     println!("cargo:rerun-if-changed=csrc/btstack_platform.c");
     println!("cargo:rerun-if-changed=csrc/btstack_stub.c");
+    println!("cargo:rerun-if-changed=csrc/app.rc");
+    println!("cargo:rerun-if-changed=csrc/app.manifest");
 }
 
 fn add_c_file(build: &mut cc::Build, path: &Path) {
     println!("cargo:rerun-if-changed={}", path.display());
     build.file(path);
+}
+
+// ---------------------------------------------------------------------------
+// UAC マニフェスト埋め込み（Windows クロスコンパイル用）
+// ---------------------------------------------------------------------------
+
+/// windres (mingw) で .rc → .o にコンパイルし、リンクさせる。
+/// これにより exe に管理者権限要求のマニフェストが埋め込まれる。
+fn compile_manifest() {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let rc_file = Path::new("csrc/app.rc");
+    let obj_file = out_dir.join("app.res.o");
+
+    let status = std::process::Command::new("x86_64-w64-mingw32-windres")
+        .args([
+            "--input",
+            &rc_file.to_string_lossy(),
+            "--output",
+            &obj_file.to_string_lossy(),
+            "--output-format=coff",
+        ])
+        .status()
+        .expect("x86_64-w64-mingw32-windres の実行に失敗しました");
+
+    if !status.success() {
+        panic!("windres によるマニフェストコンパイルに失敗しました");
+    }
+
+    // リンカにオブジェクトファイルを渡す
+    println!("cargo:rustc-link-arg={}", obj_file.display());
 }
 
 // ---------------------------------------------------------------------------
