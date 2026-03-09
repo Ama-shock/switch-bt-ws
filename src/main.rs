@@ -29,8 +29,15 @@ use tracing_subscriber::EnvFilter;
 use crate::api::AppState;
 use crate::controller::ControllerManager;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // --debug フラグがあれば RUST_LOG を debug に設定
+    if args.iter().any(|a| a == "--debug") {
+        std::env::set_var("RUST_LOG", "debug");
+    }
 
     // --worker フラグでワーカーモードに切り替える
     if args.len() > 1 && args[1] == "--worker" {
@@ -47,16 +54,42 @@ fn main() -> anyhow::Result<()> {
         .block_on(run_server())
 }
 
+fn print_banner() {
+    println!("switch-bt-ws v{VERSION}");
+    println!();
+    println!("This software uses BTStack:");
+    println!("  Copyright (C) 2009 BlueKitchen GmbH. All rights reserved.");
+    println!("  Redistribution and use in source and binary forms, with or without");
+    println!("  modification, are permitted provided that the following conditions are met:");
+    println!("  1. Redistributions of source code must retain the above copyright notice.");
+    println!("  2. Redistributions in binary form must reproduce the above copyright notice");
+    println!("     in the documentation and/or other materials provided with the distribution.");
+    println!("  3. Neither the name of the copyright holders nor the names of contributors");
+    println!("     may be used to endorse or promote products derived from this software");
+    println!("     without specific prior written permission.");
+    println!("  4. Any redistribution, use, or modification is done solely for personal");
+    println!("     benefit and not for any commercial purpose or for monetary gain.");
+    println!("  See https://github.com/bluekitchen/btstack/blob/master/LICENSE");
+    println!("      https://github.com/mizuyoukanao/btstack?tab=License-1-ov-file");
+    println!();
+}
+
 fn init_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")),
         )
         .init();
 }
 
 async fn run_server() -> anyhow::Result<()> {
     init_logging();
+    print_banner();
+
+    let port: u16 = std::env::var("SWITCH_BT_WS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8765);
 
     let controllers = Arc::new(ControllerManager::new());
 
@@ -64,7 +97,7 @@ async fn run_server() -> anyhow::Result<()> {
         controllers: Arc::clone(&controllers),
     };
 
-    let addr: SocketAddr = "127.0.0.1:8765".parse()?;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let app = api::build_router(state);
 
     tracing::info!("HTTP サーバー起動: http://{addr}");

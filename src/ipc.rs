@@ -33,6 +33,14 @@ pub enum WorkerCommand {
     RumbleRegister { key: u32 },
     /// Amiibo データを送信する（ファイルパス）。
     Amiibo { path: String },
+    /// HCI を再起動して再接続を試みる。
+    Reconnect,
+    /// リンクキー全削除 + HCI リセット（シンクロボタン1回押し相当）。
+    Sync,
+    /// ペアリングループ開始（接続されるまでシンクロを繰り返す）。
+    SyncStart,
+    /// ペアリングループ停止。
+    SyncStop,
     /// ワーカーをシャットダウンする。
     Shutdown,
 }
@@ -48,7 +56,7 @@ pub enum WorkerEvent {
     /// ワーカーの準備が完了した（BTStack 初期化済み）。
     Ready,
     /// 定期的なステータス更新。
-    Status { paired: bool, rumble: bool },
+    Status { paired: bool, rumble: bool, syncing: bool },
     /// ワーカーがシャットダウンした。
     Shutdown,
     /// エラーが発生した。

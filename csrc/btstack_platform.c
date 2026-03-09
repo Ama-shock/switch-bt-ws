@@ -76,7 +76,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     switch (btstack_event_state_get_state(packet)) {
         case HCI_STATE_WORKING:
             gap_local_bd_addr(local_addr);
-            printf("[btstack] 動作中: %s\n", bd_addr_to_str(local_addr));
+            fprintf(stderr, "[btstack] 動作中: BD_ADDR=%s\n", bd_addr_to_str(local_addr));
 
             /* ローカル BD アドレスを使った TLV パスを構築 */
             btstack_strcpy(tlv_db_path, sizeof(tlv_db_path), TLV_DB_PATH_PREFIX);
@@ -111,7 +111,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
 /* シャットダウンを開始する。CTRL-C ハンドラおよび shutdown_gamepad() から呼ばれる。 */
 static void trigger_shutdown(void)
 {
-    printf("[btstack] シャットダウン要求を受け付けました。\n");
+    fprintf(stderr, "[btstack] シャットダウン要求を受け付けました。\n");
     log_info("trigger_shutdown: HCI 電源オフを要求");
     shutdown_triggered = true;
     hci_power_control(HCI_POWER_OFF);
@@ -133,7 +133,7 @@ static void btstack_platform_run(void)
     /* ログ行がすぐに表示されるよう標準出力のバッファリングを無効化 */
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    printf("[btstack] switch-bt-ws プラットフォーム起動\n");
+    fprintf(stderr, "[btstack] switch-bt-ws プラットフォーム起動\n");
 
     /* コア初期化 */
     btstack_memory_init();

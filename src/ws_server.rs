@@ -94,7 +94,7 @@ async fn handle_socket(socket: WebSocket, handle: Arc<ControllerHandle>) {
 
 fn worker_event_to_server_msg(event: WorkerEvent) -> Option<ServerMessage> {
     match event {
-        WorkerEvent::Status { paired, rumble } => Some(ServerMessage::Status { paired, rumble }),
+        WorkerEvent::Status { paired, rumble, .. } => Some(ServerMessage::Status { paired, rumble }),
         WorkerEvent::Error { message } => Some(ServerMessage::Error { message }),
         _ => None,
     }

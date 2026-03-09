@@ -68,6 +68,14 @@ extern "C" {
     #[link_name = "send_amiibo"]
     fn ffi_send_amiibo(path: *const std::os::raw::c_char);
 
+    /// HCI を OFF→ON サイクルして discoverable 状態をリセットする。
+    /// apply_patches.sh によって btkeyLib.c に追加された関数。
+    fn reconnect_gamepad();
+
+    /// リンクキー全削除 + HCI リセット（シンクロボタン長押し相当）。
+    /// apply_patches.sh によって btkeyLib.c に追加された関数。
+    fn sync_gamepad();
+
     /// VID/PID+インスタンス番号でターゲット USB ドングルを指定する。
     /// apply_patches.sh によって hci_transport_h2_winusb.c に追加された関数。
     /// 非 Windows では btstack_stub.c の空スタブが使われる。
@@ -140,6 +148,16 @@ pub fn get_rumble_state() -> bool {
 /// 振動イベント時に押下するボタンのビットマスクを登録する。
 pub fn rumble_register(key: u32) {
     unsafe { ffi_rumble_register(key) }
+}
+
+/// HCI 電源を OFF→ON サイクルして再接続を試みる。
+pub fn reconnect() {
+    unsafe { reconnect_gamepad() }
+}
+
+/// リンクキーを全削除して新規ペアリングモードに入る（シンクロボタン長押し相当）。
+pub fn sync() {
+    unsafe { sync_gamepad() }
 }
 
 /// Amiibo の `.bin` ダンプファイルを読み込んで送信する。

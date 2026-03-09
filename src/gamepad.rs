@@ -155,12 +155,26 @@ pub fn axis_to_stick(v: f32) -> u32 {
 /// Web Gamepad の Y 軸は**上が負**（Switch と同じ向き）のため、追加の反転は不要です。
 pub fn map_axes(axes: &[f32]) -> (u32, u32, u32, u32) {
     let get = |i: usize| axes.get(i).copied().unwrap_or(0.0);
-    (
-        axis_to_stick(get(0)), // 左スティック 水平
-        axis_to_stick(get(1)), // 左スティック 垂直
-        axis_to_stick(get(2)), // 右スティック 水平
-        axis_to_stick(get(3)), // 右スティック 垂直
-    )
+
+    // クライアントが既に 0〜4095 にマッピング済みの値を送る場合がある。
+    // -1.0〜1.0 レンジ外の値が含まれていれば、マッピング済みとみなしてそのまま使う。
+    let pre_mapped = axes.iter().any(|&v| v < -1.5 || v > 1.5);
+
+    if pre_mapped {
+        (
+            (get(0) as u32).min(4095),
+            (get(1) as u32).min(4095),
+            (get(2) as u32).min(4095),
+            (get(3) as u32).min(4095),
+        )
+    } else {
+        (
+            axis_to_stick(get(0)), // 左スティック 水平
+            axis_to_stick(get(1)), // 左スティック 垂直
+            axis_to_stick(get(2)), // 右スティック 水平
+            axis_to_stick(get(3)), // 右スティック 垂直
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

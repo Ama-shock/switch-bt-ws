@@ -37,11 +37,28 @@
 //! { "type": "error",  "message": "..." }
 //! ```
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // ---------------------------------------------------------------------------
 // クライアント → サーバー
 // ---------------------------------------------------------------------------
+
+/// JSON 値（bool / number）を f32 に変換するカスタムデシリアライザ。
+/// クライアントが `buttons` を `[false, true, ...]` で送る場合に対応する。
+fn deserialize_flexible_f32_vec<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .map(|v| match v {
+            serde_json::Value::Bool(b) => if b { 1.0 } else { 0.0 },
+            serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0) as f32,
+            _ => 0.0,
+        })
+        .collect())
+}
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -49,10 +66,11 @@ pub enum ClientMessage {
     /// Web Gamepad API から取得したゲームパッド状態。
     GamepadState {
         /// ボタン値（インデックス 0〜17）。0.5 以上を押下とみなす。
-        #[serde(default)]
+        /// bool (true/false) または f32 (0.0〜1.0) のどちらでも受け付ける。
+        #[serde(default, deserialize_with = "deserialize_flexible_f32_vec")]
         buttons: Vec<f32>,
-        /// 軸値 [左X, 左Y, 右X, 右Y]、-1.0〜1.0。
-        #[serde(default)]
+        /// 軸値。-1.0〜1.0 または 0〜4095（マッピング済み）のどちらでも受け付ける。
+        #[serde(default, deserialize_with = "deserialize_flexible_f32_vec")]
         axes: Vec<f32>,
     },
 

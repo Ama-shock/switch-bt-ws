@@ -146,4 +146,242 @@ awk '
 mv "${USB_H}.tmp" "$USB_H"
 echo "[patch] hci_transport_usb.h: 完了"
 
+# ---------------------------------------------------------------------------
+# パッチ 3: btkeyLib.c に reconnect_gamepad() を追加
+# ---------------------------------------------------------------------------
+echo "[patch] btkeyLib.c にパッチを適用中 ..."
+
+BTKEYLIB_C="${BTSTACK_ROOT}/example/btkeyLib.c"
+
+if [ ! -f "$BTKEYLIB_C" ]; then
+    echo "[patch] エラー: ファイルが見つかりません: $BTKEYLIB_C" >&2
+    exit 1
+fi
+
+backup "$BTKEYLIB_C"
+
+# reconnect_gamepad() / sync_gamepad() が未追加の場合のみ追加
+# 重要: BTStack API はスレッドセーフではないため、hci_power_control() 等は
+# BTStack の run loop スレッドで実行する必要がある。
+# btstack_run_loop_execute_on_main_thread() を使って安全にキューイングする。
+if ! grep -q 'reconnect_gamepad' "$BTKEYLIB_C"; then
+    # gamepad_paired() 関数の直前に reconnect_gamepad() と sync_gamepad() を挿入
+    awk '
+    /^bool.*gamepad_paired/ && !patched_reconnect {
+        print "#include \"btstack_run_loop.h\""
+        print ""
+        print "/* --- switch-bt-ws patch: thread-safe reconnect/sync via run loop --- */"
+        print "static btstack_context_callback_registration_t reconnect_callback_reg;"
+        print "static btstack_context_callback_registration_t sync_callback_reg;"
+        print ""
+        print "static void do_reconnect_on_main(void * context) {"
+        print "    (void)context;"
+        print "    fprintf(stderr, \"[btkeyLib] do_reconnect: HCI OFF->ON (on main thread)\\n\");"
+        print "    paired = false;"
+        print "    hid_cid = 0;"
+        print "    pairing_state = 0;"
+        print "    hci_power_control(HCI_POWER_OFF);"
+        print "    hci_power_control(HCI_POWER_ON);"
+        print "}"
+        print ""
+        print "static void do_sync_on_main(void * context) {"
+        print "    (void)context;"
+        print "    fprintf(stderr, \"[btkeyLib] do_sync: delete link keys + HCI OFF->ON (on main thread)\\n\");"
+        print "    paired = false;"
+        print "    hid_cid = 0;"
+        print "    pairing_state = 0;"
+        print "    gap_delete_all_link_keys();"
+        print "    hci_power_control(HCI_POWER_OFF);"
+        print "    hci_power_control(HCI_POWER_ON);"
+        print "}"
+        print ""
+        print "//----------------------------------------------------------"
+        print "// DLL関数"
+        print "// 再接続シグナルを送信（HCI OFF→ON で discoverable 状態をリセット）"
+        print "// 任意のスレッドから安全に呼び出し可能"
+        print "//----------------------------------------------------------"
+        print "void EXPORT_API reconnect_gamepad()"
+        print "{"
+        print "    fprintf(stderr, \"[btkeyLib] reconnect_gamepad: queuing on main thread\\n\");"
+        print "    reconnect_callback_reg.callback = &do_reconnect_on_main;"
+        print "    btstack_run_loop_execute_on_main_thread(&reconnect_callback_reg);"
+        print "}"
+        print ""
+        print "//----------------------------------------------------------"
+        print "// DLL関数"
+        print "// シンクロボタン長押し相当: リンクキー全削除 + HCI リセット"
+        print "// 任意のスレッドから安全に呼び出し可能"
+        print "//----------------------------------------------------------"
+        print "void EXPORT_API sync_gamepad()"
+        print "{"
+        print "    fprintf(stderr, \"[btkeyLib] sync_gamepad: queuing on main thread\\n\");"
+        print "    sync_callback_reg.callback = &do_sync_on_main;"
+        print "    btstack_run_loop_execute_on_main_thread(&sync_callback_reg);"
+        print "}"
+        print "/* --- end switch-bt-ws patch --- */"
+        print ""
+        patched_reconnect = 1
+    }
+    { print }
+    ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
+    mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: reconnect_gamepad() / sync_gamepad() を追加 (thread-safe)"
+else
+    echo "[patch] btkeyLib.c: reconnect_gamepad() は既に存在（スキップ）"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 4: HCI_STATE_WORKING で gap_discoverable_control(1) を再呼び出し
+# ---------------------------------------------------------------------------
+# HCI OFF→ON 後に discoverable モードが無効になる問題を修正。
+# nintendo_packet_handler の BTSTACK_EVENT_STATE ハンドラに
+# gap_discoverable_control(1) を追加する。
+if ! grep -q 'gap_discoverable_control.*nintendo_packet_handler\|re-enable discoverable' "$BTKEYLIB_C"; then
+    awk '
+    /btstack_event_state_get_state.*HCI_STATE_WORKING.*return/ && !patched_discoverable {
+        print $0
+        print "                /* switch-bt-ws patch: HCI 再起動後も discoverable + connectable に */"
+        print "                gap_discoverable_control(1);"
+        print "                gap_connectable_control(1);"
+        patched_discoverable = 1
+        next
+    }
+    { print }
+    ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
+    mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: HCI_STATE_WORKING で gap_discoverable_control(1) + gap_connectable_control(1) を追加"
+else
+    echo "[patch] btkeyLib.c: gap_discoverable_control パッチは既に存在（スキップ）"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 5: nintendo_packet_handler にデバッグログを追加
+# ---------------------------------------------------------------------------
+echo "[patch] btkeyLib.c にデバッグログを追加中 ..."
+
+# 5a: HCI_STATE_WORKING の gap_connectable_control(1) の直後にログ追加
+if ! grep -q 'fprintf.*stderr.*discoverable' "$BTKEYLIB_C"; then
+    sed -i '/gap_connectable_control(1);/{
+        a\                fprintf(stderr, "[btkeyLib] HCI_STATE_WORKING: discoverable(1) + connectable(1) called\\n");
+    }' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: HCI_STATE_WORKING デバッグログを追加"
+fi
+
+# 5b-5f: HID イベントと btstack_main のデバッグログ追加（awk で安全に挿入）
+if ! grep -q 'fprintf.*stderr.*HID_CONNECTION_OPENED' "$BTKEYLIB_C"; then
+    awk '
+    # HID_SUBEVENT_CONNECTION_OPENED: hid_cid 取得行の直後にログ
+    /hid_cid = hid_subevent_connection_opened_get_hid_cid/ {
+        print $0
+        print "                        fprintf(stderr, \"[btkeyLib] HID_CONNECTION_OPENED: hid_cid=%d\\n\", hid_cid);"
+        next
+    }
+    # HID_SUBEVENT_CONNECTION_OPENED: status チェック失敗時のログ
+    # "if (status)" の次の行の "{" の中にログを挿入
+    /hid_subevent_connection_opened_get_status/ { found_status = 1 }
+    found_status && /if \(status\)/ { found_if_status = 1 }
+    found_if_status && /\{/ && !added_fail_log {
+        print $0
+        print "                            fprintf(stderr, \"[btkeyLib] HID_CONNECTION_OPENED_FAILED: status=%d\\n\", status);"
+        added_fail_log = 1
+        found_status = 0
+        found_if_status = 0
+        next
+    }
+    # HID_SUBEVENT_CONNECTION_CLOSED: ブロック開始 { の中にログ
+    /case HID_SUBEVENT_CONNECTION_CLOSED:/ { found_closed = 1 }
+    found_closed && /\{/ && !added_closed_log {
+        print $0
+        print "                        fprintf(stderr, \"[btkeyLib] HID_CONNECTION_CLOSED\\n\");"
+        added_closed_log = 1
+        found_closed = 0
+        next
+    }
+    # paired = true の直後にログ
+    /paired = true;/ {
+        print $0
+        print "                                fprintf(stderr, \"[btkeyLib] >>> PAIRED! pairing_state=%d hid_cid=%d\\n\", pairing_state, hid_cid);"
+        next
+    }
+    # HCI_EVENT_HID_META の switch 文の直前にサブイベントコードログ追加
+    /hci_event_hid_meta_get_subevent_code/ {
+        print "                fprintf(stderr, \"[btkeyLib] HID_META: subevent=0x%02x\\n\", hci_event_hid_meta_get_subevent_code(packet));"
+    }
+    # btstack_main 内の hci_power_control(HCI_POWER_ON) の直後にログ
+    /hci_power_control\(HCI_POWER_ON\)/ && !added_main_log {
+        print $0
+        print "    fprintf(stderr, \"[btkeyLib] btstack_main: initialized, HCI_POWER_ON requested\\n\");"
+        added_main_log = 1
+        next
+    }
+    { print }
+    ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
+    mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: HID イベント + btstack_main デバッグログを追加"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 6: btstack_main() に gap_connectable_control(1) を追加
+# ---------------------------------------------------------------------------
+# btstack_main() の gap_discoverable_control(1) 直後に connectable も有効化する。
+if ! grep -q 'gap_connectable_control' "$BTKEYLIB_C" | grep -q 'btstack_main'; then
+    # btstack_main 内の gap_discoverable_control(1) の直後（gap_set_class_of_device の前）に挿入
+    sed -i '/^    gap_discoverable_control(1);$/{
+        a\    gap_connectable_control(1);  /* switch-bt-ws patch: page scan 有効化 */
+    }' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: btstack_main に gap_connectable_control(1) を追加"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 7: hid_normally_connectable を 1 に変更
+# ---------------------------------------------------------------------------
+# joycontrol は HIDNormallyConnectable=true に設定している。
+# 元コードは 0 だが、Switch がデバイスを通常接続可能と認識するために 1 が必要。
+if grep -q 'hid_normally_connectable = 0' "$BTKEYLIB_C"; then
+    sed -i 's/uint8_t hid_normally_connectable = 0;/uint8_t hid_normally_connectable = 1;  \/* switch-bt-ws patch: joycontrol と同じ *\//' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: hid_normally_connectable を 1 に変更"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 8: SSP 無効化 + bondable モード設定
+# ---------------------------------------------------------------------------
+# joycontrol は認証を完全に無効化している (RequireAuthentication=False)。
+# BTStack のデフォルトでは SSP が有効で、Switch との接続ネゴシエーションに
+# 失敗する可能性がある。
+# gap_ssp_set_enable(0) で SSP を無効化し、Switch 側から PIN なしで接続できるようにする。
+# gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT) で "Just Works" ペアリング。
+# gap_set_bondable_mode(1) でリンクキーの保存を許可する。
+if ! grep -q 'gap_ssp_set_io_capability' "$BTKEYLIB_C"; then
+    sed -i '/gap_set_allow_role_switch(true);/a\    /* switch-bt-ws patch: SSP を "Just Works" に設定（joycontrol 互換） */\n    gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);\n    gap_ssp_set_authentication_requirement(0);  /* no MITM */\n    gap_set_bondable_mode(1);' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: SSP Just Works + bondable モードを設定"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 9: nintendo_packet_handler の冒頭に HCI イベントログ追加
+# ---------------------------------------------------------------------------
+# すべての HCI イベントタイプをログに出力する。
+# これにより、Switch からの接続試行（HCI_EVENT_CONNECTION_REQUEST=0x04 等）を検出できる。
+# 注意: if() の直後の { の中に挿入しないと if 文の構造が壊れる。
+if ! grep -q 'fprintf.*stderr.*pkt:' "$BTKEYLIB_C"; then
+    # "uint8_t status;" の直後に、ノイズの多いイベントを除外したログを挿入
+    # 除外: 0x6e(BTStack内部), 0x13(CompletedPackets), 0x0e(CmdComplete), 0x0f(CmdStatus)
+    sed -i '/^static void nintendo_packet_handler/,/uint8_t status;/ {
+        /uint8_t status;/a\    if (packet_type == 4 && packet[0] != 0x6e && packet[0] != 0x13 && packet[0] != 0x0e && packet[0] != 0x0f) {\n        fprintf(stderr, "[btkeyLib] pkt: evt=0x%02x size=%d\\n", packet[0], packet_size);\n    }
+    }' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: HCI イベントデバッグログを追加（フィルタ付き）"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 10: do_sync_on_main で gap_discoverable + gap_connectable を明示的に呼ぶ
+# ---------------------------------------------------------------------------
+# HCI OFF→ON 後、HCI_STATE_WORKING イベントで discoverable/connectable を
+# 再有効化するが、念のため sync 関数内でも明示的にフラグをリセットする。
+# また、SSP 設定も再適用する。
+if ! grep -q 'gap_discoverable_control.*do_sync' "$BTKEYLIB_C"; then
+    sed -i '/do_sync_on_main.*context.*{/,/^}/ {
+        /hci_power_control(HCI_POWER_ON);/a\    /* switch-bt-ws patch: sync 後に明示的に discoverable + connectable 再設定 */\n    fprintf(stderr, "[btkeyLib] do_sync: HCI OFF->ON queued, waiting for HCI_STATE_WORKING...\\n");
+    }' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: do_sync_on_main にログを追加"
+fi
+
 echo "[patch] 全パッチの適用が完了しました。"
