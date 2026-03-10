@@ -243,6 +243,16 @@ if ! grep -q 'gap_discoverable_control.*nintendo_packet_handler\|re-enable disco
         print "                /* switch-bt-ws patch: HCI 再起動後も discoverable + connectable に */"
         print "                gap_discoverable_control(1);"
         print "                gap_connectable_control(1);"
+        print "                /* switch-bt-ws patch: 実際の BD_ADDR を reply02 / reply01_1 に書き込む */"
+        print "                {"
+        print "                    bd_addr_t local_addr;"
+        print "                    gap_local_bd_addr(local_addr);"
+        print "                    /* reply02 offset 20-25: Device Info の BD_ADDR */"
+        print "                    memcpy(reply02 + 20, local_addr, 6);"
+        print "                    /* reply01_1 offset 17-22: SPI Flash の BD_ADDR */"
+        print "                    memcpy(reply01_1 + 17, local_addr, 6);"
+        print "                    fprintf(stderr, \"[btkeyLib] BD_ADDR patched into reply02/reply01_1: %s\\n\", bd_addr_to_str(local_addr));"
+        print "                }"
         patched_discoverable = 1
         next
     }
