@@ -17,6 +17,7 @@ mod btstack;
 mod controller;
 mod driver;
 mod gamepad;
+mod global_ws;
 mod ipc;
 mod protocol;
 mod worker;
@@ -101,7 +102,8 @@ async fn run_server() -> anyhow::Result<()> {
     let app = api::build_router(state);
 
     tracing::info!("HTTP サーバー起動: http://{addr}");
-    tracing::info!("WebSocket エンドポイント: ws://{addr}/ws/<controller_id>");
+    tracing::info!("グローバル WS: ws://{addr}/ws");
+    tracing::info!("コントローラー WS: ws://{addr}/ws/<controller_id>");
     tracing::info!("コントローラー追加: POST http://{addr}/api/controllers {{\"vid\": 2578, \"pid\": 1}}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -407,8 +407,21 @@ fi
 # CAN_SEND_NOW 内の else if (paired && (pairing_state == 13 || pairing_state == 15))
 # を修正して、paired でなくても state 15 で paired = true にする。
 if ! grep -q 'switch-bt-ws patch: state 15 also sets paired' "$BTKEYLIB_C"; then
+    # 元のコードは 4 行:
+    #   else if (paired && (pairing_state == 13 || pairing_state == 15))
+    #   {
+    #       // After responding to info requests, return to normal operation
+    #       pairing_state = 0;
+    #   }
+    # 条件行にマッチしたら、続く 4 行 ({, コメント, pairing_state=0, }) も読み飛ばして
+    # 新しいコードに置き換える。
     awk '
     /else if \(paired && \(pairing_state == 13 \|\| pairing_state == 15\)\)/ && !patched_s15 {
+        # 元のブロック本体 4 行を読み飛ばす
+        getline  # {
+        getline  # // After responding ...
+        getline  # pairing_state = 0;
+        getline  # }
         print "                            /* switch-bt-ws patch: state 15 also sets paired */"
         print "                            else if (pairing_state == 15)"
         print "                            {"
@@ -449,14 +462,83 @@ if ! grep -q 'player_leds' "$BTKEYLIB_C"; then
         i\    if(report[9] == 48) { player_leds = report[10]; }  /* switch-bt-ws patch: capture player LED */
     }' "$BTKEYLIB_C"
 
-    # 3. gamepad_paired() の直後に get_player_leds() を追加
+    # 3. gamepad_paired() の閉じ括弧の直後に get_player_leds() を追加
+    #    gamepad_paired() は 4行: signature + { + return + }
     sed -i '/^bool EXPORT_API gamepad_paired()/{
+        N
         N
         N
         a\uint8_t EXPORT_API get_player_leds()\n{\n    return player_leds;\n}
     }' "$BTKEYLIB_C"
 
     echo "[patch] btkeyLib.c: player_leds グローバル変数と get_player_leds() を追加"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 15: HID_CONNECTION_CLOSED で paired = false にリセットする
+# ---------------------------------------------------------------------------
+# 元のコードでは hid_cid と pairing_state のみリセットしていたため、
+# Switch が切断しても paired フラグが true のまま残り、
+# サーバーが「接続中」と誤報告していた。
+if ! grep -q 'switch-bt-ws patch: reset paired on close' "$BTKEYLIB_C"; then
+    awk '
+    /HID_SUBEVENT_CONNECTION_CLOSED/ { in_close = 1 }
+    in_close && /pairing_state = 0;/ {
+        print
+        print "                        paired = false;  /* switch-bt-ws patch: reset paired on close */"
+        in_close = 0
+        next
+    }
+    { print }
+    ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
+    mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: HID_CONNECTION_CLOSED で paired = false を追加"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 16: HCI_EVENT_LINK_KEY_NOTIFICATION を直接キャプチャして DB に格納
+# ---------------------------------------------------------------------------
+# BTStack の HCI レイヤーはボンディングフラグが立っていない場合、
+# リンクキーをメモリ DB に保存しない（hci.c:4057-4063）。
+# Switch は SSP でボンディングを要求しないことがあり、かつ Patch 8 で
+# auth_requirement=0（no bonding）に設定しているため、この条件を満たさない。
+#
+# 対策: nintendo_packet_handler で HCI_EVENT_LINK_KEY_NOTIFICATION を直接
+# ハンドリングし、btstack_link_key_db_memory_instance()->put_link_key() で
+# ボンディングロジックをバイパスして直接メモリ DB に格納する。
+if ! grep -q 'switch-bt-ws patch: capture link key' "$BTKEYLIB_C"; then
+    awk '
+    # include を追加（nintendo_packet_handler の前に）
+    /^static void nintendo_packet_handler/ && !added_lk_include {
+        print "#include \"classic/btstack_link_key_db_memory.h\"  /* switch-bt-ws patch: for direct link key storage */"
+        print ""
+        added_lk_include = 1
+    }
+    # BTSTACK_EVENT_STATE case の前に HCI_EVENT_LINK_KEY_NOTIFICATION case を挿入
+    /case BTSTACK_EVENT_STATE:/ && !patched_lk {
+        print "            case HCI_EVENT_LINK_KEY_NOTIFICATION:  /* switch-bt-ws patch: capture link key */"
+        print "            {"
+        print "                bd_addr_t lk_addr;"
+        print "                link_key_t lk_key;"
+        print "                hci_event_link_key_request_get_bd_addr(packet, lk_addr);"
+        print "                memcpy(lk_key, &packet[8], 16);"
+        print "                link_key_type_t lk_type = (link_key_type_t)packet[24];"
+        print "                fprintf(stderr, \"[btkeyLib] LINK_KEY_NOTIFICATION: addr=%s type=%d\\n\","
+        print "                        bd_addr_to_str(lk_addr), lk_type);"
+        print "                /* BTStack の bonding ロジックをバイパスして直接 DB に格納 */"
+        print "                const btstack_link_key_db_t *lk_db = btstack_link_key_db_memory_instance();"
+        print "                if (lk_db && lk_db->put_link_key) {"
+        print "                    lk_db->put_link_key(lk_addr, lk_key, lk_type);"
+        print "                    fprintf(stderr, \"[btkeyLib] link key stored in memory DB\\n\");"
+        print "                }"
+        print "                break;"
+        print "            }"
+        patched_lk = 1
+    }
+    { print }
+    ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
+    mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: HCI_EVENT_LINK_KEY_NOTIFICATION でリンクキーを直接メモリ DB に格納"
 fi
 
 echo "[patch] 全パッチの適用が完了しました。"

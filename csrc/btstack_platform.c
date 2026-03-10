@@ -187,6 +187,7 @@ int export_link_keys(uint8_t *buf, int buf_size)
         offset += 23;
     }
     db->iterator_done(&it);
+    fprintf(stderr, "[btstack] export_link_keys: %d bytes (%d entries)\n", offset, offset / 23);
     return offset;
 }
 

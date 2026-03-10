@@ -18,7 +18,37 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
+use crate::driver;
 use crate::ipc::{WorkerCommand, WorkerEvent};
+
+// ---------------------------------------------------------------------------
+// グローバルイベント（全体状態同期 WS 用）
+// ---------------------------------------------------------------------------
+
+/// 全体状態同期用のイベント。グローバル WS ハンドラに通知される。
+#[derive(Debug, Clone)]
+pub enum GlobalEvent {
+    /// コントローラーリストが変化した（追加・削除）。
+    ControllersChanged,
+    /// デバイスリストが変化した（ドライバ操作後）。
+    DevicesChanged,
+    /// 個別コントローラーの状態が変化した。
+    ControllerStatus {
+        id: u32,
+        paired: bool,
+        rumble: bool,
+        syncing: bool,
+        player: u8,
+    },
+    /// コントローラーからリンクキーが送信された。
+    ControllerLinkKeys {
+        id: u32,
+        vid: String,
+        pid: String,
+        instance: u32,
+        data: String,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // 公開型
@@ -43,6 +73,9 @@ pub struct ControllerInfo {
     pub syncing: bool,
     /// Switch が割り当てたプレイヤー番号（1〜4）。未割当なら 0。
     pub player: u8,
+    /// BTStack メモリ上のリンクキー（base64）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_keys: Option<String>,
 }
 
 /// コントローラーの状態（内部用）。
@@ -55,6 +88,7 @@ struct ControllerState {
     rumble: bool,
     syncing: bool,
     player: u8,
+    link_keys: Option<String>,
 }
 
 /// 個々のワーカープロセスへのハンドル。
@@ -89,6 +123,7 @@ impl ControllerHandle {
             rumble: state.rumble,
             syncing: state.syncing,
             player: state.player,
+            link_keys: state.link_keys.clone(),
         }
     }
 
@@ -107,14 +142,43 @@ pub struct ControllerManager {
     /// id → ControllerHandle
     controllers: Arc<RwLock<HashMap<u32, Arc<ControllerHandle>>>>,
     next_id: Mutex<u32>,
+    /// グローバルイベントブロードキャスト
+    global_tx: broadcast::Sender<GlobalEvent>,
+    /// デバイスリストのキャッシュ
+    cached_devices: RwLock<Vec<driver::BtUsbDevice>>,
 }
 
 impl ControllerManager {
     pub fn new() -> Self {
+        let (global_tx, _) = broadcast::channel::<GlobalEvent>(64);
         Self {
             controllers: Arc::new(RwLock::new(HashMap::new())),
             next_id: Mutex::new(0),
+            global_tx,
+            cached_devices: RwLock::new(Vec::new()),
         }
+    }
+
+    /// グローバルイベントの受信端を返す。
+    pub fn subscribe_global(&self) -> broadcast::Receiver<GlobalEvent> {
+        self.global_tx.subscribe()
+    }
+
+    /// キャッシュされたデバイスリストを返す。
+    pub async fn get_cached_devices(&self) -> Vec<driver::BtUsbDevice> {
+        self.cached_devices.read().await.clone()
+    }
+
+    /// デバイスリストのキャッシュを更新する。
+    pub async fn set_cached_devices(&self, devices: Vec<driver::BtUsbDevice>) {
+        *self.cached_devices.write().await = devices;
+    }
+
+    /// デバイスリストを再スキャンしてキャッシュを更新し、全クライアントに通知する。
+    pub async fn refresh_and_notify_devices(&self) {
+        let devices = driver::list_bt_usb_devices().await.unwrap_or_default();
+        *self.cached_devices.write().await = devices;
+        let _ = self.global_tx.send(GlobalEvent::DevicesChanged);
     }
 
     /// 新しいコントローラーワーカーを起動して登録する。
@@ -152,6 +216,7 @@ impl ControllerManager {
             rumble: false,
             syncing: false,
             player: 0,
+            link_keys: None,
         }));
 
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
@@ -169,18 +234,27 @@ impl ControllerManager {
         tokio::spawn(stdin_writer(child_stdin, stdin_rx));
 
         // stdout 読み取りタスク（イベント処理）
-        tokio::spawn(stdout_reader(child_stdout, state_clone, status_tx, id));
+        tokio::spawn(stdout_reader(
+            child_stdout,
+            state_clone,
+            status_tx,
+            self.global_tx.clone(),
+            id,
+        ));
 
         // プロセス終了監視タスク
         let controllers = Arc::clone(&self.controllers);
+        let global_tx = self.global_tx.clone();
         tokio::spawn(async move {
             let _ = child.wait().await;
             tracing::warn!("ワーカープロセス id={id} が終了しました");
             controllers.write().await.remove(&id);
+            let _ = global_tx.send(GlobalEvent::ControllersChanged);
         });
 
         self.controllers.write().await.insert(id, handle);
         tracing::info!("コントローラー id={id} を登録しました (vid={vid:04x} pid={pid:04x} inst={instance})");
+        let _ = self.global_tx.send(GlobalEvent::ControllersChanged);
 
         Ok(id)
     }
@@ -244,9 +318,15 @@ async fn stdout_reader(
     stdout: ChildStdout,
     state: Arc<RwLock<ControllerState>>,
     status_tx: broadcast::Sender<WorkerEvent>,
+    global_tx: broadcast::Sender<GlobalEvent>,
     id: u32,
 ) {
     let mut reader = BufReader::new(stdout).lines();
+    // 状態変化のみグローバルに通知するための前回値
+    let mut prev_paired = false;
+    let mut prev_syncing = false;
+    let mut prev_player = 0u8;
+
     while let Ok(Some(line)) = reader.next_line().await {
         let line = line.trim().to_string();
         if line.is_empty() || !line.starts_with('{') {
@@ -254,12 +334,40 @@ async fn stdout_reader(
         }
         match serde_json::from_str::<WorkerEvent>(&line) {
             Ok(event) => {
-                if let WorkerEvent::Status { paired, rumble, syncing, player } = &event {
-                    let mut s = state.write().await;
-                    s.paired = *paired;
-                    s.rumble = *rumble;
-                    s.syncing = *syncing;
-                    s.player = *player;
+                match &event {
+                    WorkerEvent::Status { paired, rumble, syncing, player } => {
+                        let mut s = state.write().await;
+                        s.paired = *paired;
+                        s.rumble = *rumble;
+                        s.syncing = *syncing;
+                        s.player = *player;
+
+                        // 意味のある変化時のみグローバルイベントを送信
+                        if *paired != prev_paired || *syncing != prev_syncing || *player != prev_player {
+                            let _ = global_tx.send(GlobalEvent::ControllerStatus {
+                                id,
+                                paired: *paired,
+                                rumble: *rumble,
+                                syncing: *syncing,
+                                player: *player,
+                            });
+                            prev_paired = *paired;
+                            prev_syncing = *syncing;
+                            prev_player = *player;
+                        }
+                    }
+                    WorkerEvent::LinkKeys { data } => {
+                        let mut s = state.write().await;
+                        s.link_keys = Some(data.clone());
+                        let _ = global_tx.send(GlobalEvent::ControllerLinkKeys {
+                            id,
+                            vid: format!("{:04x}", s.vid),
+                            pid: format!("{:04x}", s.pid),
+                            instance: s.instance,
+                            data: data.clone(),
+                        });
+                    }
+                    _ => {}
                 }
                 let _ = status_tx.send(event);
             }

@@ -4,15 +4,15 @@
 //!
 //! | メソッド | パス                       | 説明                                       |
 //! |---------|---------------------------|--------------------------------------------|
+//! | GET     | `/ws`                     | 全体状態同期 WebSocket                     |
 //! | GET     | `/ws/:id`                 | WebSocket アップグレード（コントローラー指定）|
-//! | GET     | `/api/controllers`        | 全コントローラーの情報リスト                |
 //! | POST    | `/api/controllers`        | コントローラーを追加する                    |
 //! | DELETE  | `/api/controllers/:id`    | コントローラーを削除する                    |
-//! | GET     | `/api/driver/list`        | BT USB デバイス一覧                        |
 //! | POST    | `/api/driver/install`     | WinUSB ドライバを導入                      |
 //! | POST    | `/api/driver/restore`     | 元の Bluetooth ドライバに戻す              |
 //!
-//! reconnect / sync / link-keys 操作は WebSocket (`/ws/:id`) 経由で行う。
+//! デバイス一覧・コントローラー一覧はグローバル WS (`/ws`) で同期する。
+//! reconnect / sync / link-keys 操作はコントローラー WS (`/ws/:id`) 経由で行う。
 
 use axum::{
     extract::{Path, State},
@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::{controller::ControllerManager, driver, ws_server};
+use crate::{controller::ControllerManager, driver, global_ws, ws_server};
 
 // ---------------------------------------------------------------------------
 // アプリケーション状態
@@ -43,13 +43,13 @@ pub fn build_router(state: AppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
-        // WebSocket（コントローラー ID を URL パスから取得）
+        // WebSocket
+        .route("/ws", get(global_ws::global_ws_handler))
         .route("/ws/:id", get(ws_server::ws_handler))
         // コントローラー管理
-        .route("/api/controllers",              get(api_controllers_list).post(api_controllers_add))
-        .route("/api/controllers/:id",          delete(api_controllers_remove))
+        .route("/api/controllers", post(api_controllers_add))
+        .route("/api/controllers/:id", delete(api_controllers_remove))
         // ドライバ管理
-        .route("/api/driver/list",    get(api_driver_list))
         .route("/api/driver/install", post(api_driver_install))
         .route("/api/driver/restore", post(api_driver_restore))
         .layer(cors)
@@ -59,12 +59,6 @@ pub fn build_router(state: AppState) -> Router {
 // ---------------------------------------------------------------------------
 // コントローラー管理ハンドラ
 // ---------------------------------------------------------------------------
-
-async fn api_controllers_list(
-    State(state): State<AppState>,
-) -> Json<Vec<crate::controller::ControllerInfo>> {
-    Json(state.controllers.list().await)
-}
 
 #[derive(Deserialize)]
 struct AddControllerRequest {
@@ -137,19 +131,6 @@ async fn api_controllers_remove(
 // ドライバ管理ハンドラ
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct DriverListResponse {
-    version: &'static str,
-    devices: Vec<driver::BtUsbDevice>,
-}
-
-async fn api_driver_list(_: State<AppState>) -> Json<DriverListResponse> {
-    Json(DriverListResponse {
-        version: env!("CARGO_PKG_VERSION"),
-        devices: driver::list_bt_usb_devices().await.unwrap_or_default(),
-    })
-}
-
 #[derive(Deserialize)]
 struct DriverRequest {
     vid: u16,
@@ -163,22 +144,27 @@ struct DriverResponse {
 }
 
 async fn api_driver_install(
-    _: State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<DriverRequest>,
 ) -> Json<DriverResponse> {
     match driver::install_winusb(req.vid, req.pid).await {
-        Ok(msg)  => Json(DriverResponse { success: true,  message: msg }),
-        Err(e)   => Json(DriverResponse { success: false, message: e.to_string() }),
+        Ok(msg) => {
+            state.controllers.refresh_and_notify_devices().await;
+            Json(DriverResponse { success: true, message: msg })
+        }
+        Err(e) => Json(DriverResponse { success: false, message: e.to_string() }),
     }
 }
 
 async fn api_driver_restore(
-    _: State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<DriverRequest>,
 ) -> Json<DriverResponse> {
     match driver::restore_driver(req.vid, req.pid).await {
-        Ok(msg)  => Json(DriverResponse { success: true,  message: msg }),
-        Err(e)   => Json(DriverResponse { success: false, message: e.to_string() }),
+        Ok(msg) => {
+            state.controllers.refresh_and_notify_devices().await;
+            Json(DriverResponse { success: true, message: msg })
+        }
+        Err(e) => Json(DriverResponse { success: false, message: e.to_string() }),
     }
 }
-

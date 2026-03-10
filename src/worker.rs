@@ -62,20 +62,31 @@ pub fn run(args: &[String]) {
         .spawn(move || {
             let stdout = io::stdout();
             let mut prev_paired = false;
+            let mut link_keys_sent = false;
             loop {
                 std::thread::sleep(Duration::from_millis(100));
                 let paired = btstack::is_paired();
                 let is_syncing = syncing_status.load(Ordering::Relaxed);
 
-                // ペアリング成功検出: paired になったらシンクループを停止し、リンクキーを送信
+                // ペアリング成功検出: paired になったらシンクループを停止
                 if paired && !prev_paired {
                     if is_syncing {
                         syncing_status.store(false, Ordering::Relaxed);
                         eprintln!("[worker] status: paired detected, stopping sync loop");
                     }
-                    // リンクキーを送信（ペアリング成功時）
-                    send_link_keys();
+                    link_keys_sent = false;
                 }
+
+                // paired 中はリンクキーが送信できるまでリトライ
+                if paired && !link_keys_sent {
+                    link_keys_sent = send_link_keys();
+                }
+
+                // paired 解除時にリセット
+                if !paired {
+                    link_keys_sent = false;
+                }
+
                 prev_paired = paired;
 
                 let event = WorkerEvent::Status {
@@ -212,11 +223,13 @@ fn send_event(event: &WorkerEvent) {
     let _ = lock.flush();
 }
 
-fn send_link_keys() {
+fn send_link_keys() -> bool {
     let keys = btstack::get_link_keys();
     if keys.is_empty() {
-        return;
+        return false;
     }
+    eprintln!("[worker] export_link_keys: {} bytes", keys.len());
     let data = base64::engine::general_purpose::STANDARD.encode(&keys);
     send_event(&WorkerEvent::LinkKeys { data });
+    true
 }
