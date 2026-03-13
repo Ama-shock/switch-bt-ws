@@ -374,15 +374,14 @@ if ! grep -q 'gap_discoverable_control.*do_sync' "$BTKEYLIB_C"; then
 fi
 
 # ---------------------------------------------------------------------------
-# パッチ 11: hid_report_data_callback にデバッグログを追加
+# パッチ 11: hid_report_data_callback のデバッグログ（削除済み）
 # ---------------------------------------------------------------------------
-# Switch からの HID レポートが到着しているかを確認するためのログ。
-if ! grep -q 'fprintf.*stderr.*hid_report_data_callback.*report_id' "$BTKEYLIB_C"; then
-    sed -i '/^static void hid_report_data_callback.*report_size.*report)/{
-        N
-        s/$/\n    fprintf(stderr, "[btkeyLib] hid_report: id=%d size=%d r9=0x%02x r10=0x%02x ps=%d\\n", report_id, report_size, report_size > 9 ? report[9] : 0, report_size > 10 ? report[10] : 0, pairing_state);/
-    }' "$BTKEYLIB_C"
-    echo "[patch] btkeyLib.c: hid_report_data_callback にデバッグログを追加"
+# 接続中に毎フレーム大量出力されるため削除。
+# 既に適用済みの場合はログ行を取り除く。
+if grep -q 'fprintf.*stderr.*hid_report_data_callback.*report_id' "$BTKEYLIB_C" \
+   || grep -q '\[btkeyLib\] hid_report:' "$BTKEYLIB_C"; then
+    sed -i '/fprintf(stderr, "\[btkeyLib\] hid_report:/d' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: hid_report デバッグログを削除"
 fi
 
 # ---------------------------------------------------------------------------
