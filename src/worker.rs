@@ -178,6 +178,9 @@ fn handle_command(cmd: WorkerCommand, syncing: &Arc<AtomicBool>) {
                     btstack::sync();
                     eprintln!("[worker] pairing: discoverable, waiting for Switch...");
 
+                    // HCI OFF→ON がスキャン窓と合わない場合があるため定期的にリトライ
+                    const RETRY_INTERVAL_TICKS: u32 = 75; // 15秒 (200ms × 75)
+
                     let mut tick = 0u32;
                     loop {
                         std::thread::sleep(Duration::from_millis(200));
@@ -191,6 +194,11 @@ fn handle_command(cmd: WorkerCommand, syncing: &Arc<AtomicBool>) {
                             // ペアリング成功時にリンクキーを送信（ブラウザが IndexedDB に保存）
                             send_link_keys();
                             return;
+                        }
+                        // 15秒ごとに HCI リセットを再試行（スキャン窓合わせ）
+                        if tick > 0 && tick % RETRY_INTERVAL_TICKS == 0 {
+                            eprintln!("[worker] pairing: retry HCI reset ({:.0}s)", tick as f64 * 0.2);
+                            btstack::sync();
                         }
                         // 10秒ごとにログ
                         if tick % 50 == 0 && tick > 0 {
