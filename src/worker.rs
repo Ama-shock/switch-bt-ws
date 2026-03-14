@@ -208,9 +208,15 @@ fn handle_command(cmd: WorkerCommand, syncing: &Arc<AtomicBool>) {
                             return;
                         }
                         // 15秒ごとに HCI リセットを再試行（スキャン窓合わせ）
+                        // ただしリンクキーが存在する場合は接続進行中なのでスキップ
                         if tick > 0 && tick % RETRY_INTERVAL_TICKS == 0 {
-                            eprintln!("[worker] pairing: retry HCI reset ({:.0}s)", tick as f64 * 0.2);
-                            btstack::sync();
+                            let keys = btstack::get_link_keys();
+                            if keys.is_empty() {
+                                eprintln!("[worker] pairing: retry HCI reset ({:.0}s)", tick as f64 * 0.2);
+                                btstack::sync();
+                            } else {
+                                eprintln!("[worker] pairing: connection in progress, skip retry ({:.0}s)", tick as f64 * 0.2);
+                            }
                         }
                         // 10秒ごとにログ
                         if tick % 50 == 0 && tick > 0 {
