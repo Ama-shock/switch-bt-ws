@@ -17,6 +17,7 @@ use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
+use std::fs;
 
 use crate::driver;
 use crate::ipc::{WorkerCommand, WorkerEvent};
@@ -182,7 +183,9 @@ impl ControllerManager {
     }
 
     /// 新しいコントローラーワーカーを起動して登録する。
-    pub async fn add(&self, vid: u16, pid: u16, instance: u32) -> Result<u32> {
+    /// `link_keys` が指定された場合、ワーカーにコマンドライン引数で渡し、
+    /// BTStack 起動前にインポートする。
+    pub async fn add(&self, vid: u16, pid: u16, instance: u32, link_keys: Option<String>) -> Result<u32> {
         let id = {
             let mut n = self.next_id.lock().await;
             let id = *n;
@@ -192,16 +195,30 @@ impl ControllerManager {
 
         let exe = std::env::current_exe().context("実行ファイルパスの取得に失敗")?;
 
+        // ログファイルを exe と同じディレクトリに作成
+        let log_dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let log_path = log_dir.join(format!("worker-{vid:04x}-{pid:04x}-{instance}.log"));
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("ログファイルの作成に失敗: {}", log_path.display()))?;
+        tracing::info!("ワーカーログ: {}", log_path.display());
+
         // ワーカーサブプロセスを起動
-        let mut child: Child = Command::new(&exe)
-            .arg("--worker")
+        let mut cmd = Command::new(&exe);
+        cmd.arg("--worker")
             .arg(id.to_string())
             .arg(format!("{vid:04x}"))
             .arg(format!("{pid:04x}"))
-            .arg(instance.to_string())
+            .arg(instance.to_string());
+        if let Some(ref keys) = link_keys {
+            cmd.arg("--link-keys").arg(keys);
+        }
+        let mut child: Child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::from(log_file))
             .spawn()
             .with_context(|| format!("ワーカープロセスの起動に失敗: id={id}"))?;
 
@@ -342,8 +359,26 @@ async fn stdout_reader(
                         s.syncing = *syncing;
                         s.player = *player;
 
-                        // 意味のある変化時のみグローバルイベントを送信
+                        // 意味のある変化時のみグローバルイベントを送信 + ログ
                         if *paired != prev_paired || *syncing != prev_syncing || *player != prev_player {
+                            if *paired != prev_paired {
+                                tracing::info!(
+                                    "[controller id={id}] paired: {} -> {}",
+                                    prev_paired, paired
+                                );
+                            }
+                            if *player != prev_player && *player > 0 {
+                                tracing::info!(
+                                    "[controller id={id}] player: P{}",
+                                    player
+                                );
+                            }
+                            if *syncing != prev_syncing {
+                                tracing::info!(
+                                    "[controller id={id}] syncing: {} -> {}",
+                                    prev_syncing, syncing
+                                );
+                            }
                             let _ = global_tx.send(GlobalEvent::ControllerStatus {
                                 id,
                                 paired: *paired,
@@ -359,6 +394,10 @@ async fn stdout_reader(
                     WorkerEvent::LinkKeys { data } => {
                         let mut s = state.write().await;
                         s.link_keys = Some(data.clone());
+                        tracing::info!(
+                            "[controller id={id}] link_keys: {} bytes",
+                            data.len()
+                        );
                         let _ = global_tx.send(GlobalEvent::ControllerLinkKeys {
                             id,
                             vid: format!("{:04x}", s.vid),

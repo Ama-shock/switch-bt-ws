@@ -169,6 +169,7 @@ if ! grep -q 'reconnect_gamepad' "$BTKEYLIB_C"; then
     awk '
     /^bool.*gamepad_paired/ && !patched_reconnect {
         print "#include \"btstack_run_loop.h\""
+        print "#include \"classic/btstack_link_key_db_memory.h\"  /* switch-bt-ws: for link key DB access */"
         print ""
         print "/* --- switch-bt-ws patch: thread-safe reconnect/sync via run loop --- */"
         print "static btstack_context_callback_registration_t reconnect_callback_reg;"
@@ -176,7 +177,12 @@ if ! grep -q 'reconnect_gamepad' "$BTKEYLIB_C"; then
         print ""
         print "static void do_reconnect_on_main(void * context) {"
         print "    (void)context;"
-        print "    fprintf(stderr, \"[btkeyLib] do_reconnect: HCI OFF->ON (on main thread)\\n\");"
+        print "    /* リンクキー DB の状態を確認（export_link_keys 経由） */"
+        print "    {"
+        print "        uint8_t chk_buf[23 * 16];"
+        print "        int chk_len = export_link_keys(chk_buf, sizeof(chk_buf));"
+        print "        fprintf(stderr, \"[btkeyLib] do_reconnect: link key DB has %d entries before HCI cycle\\n\", chk_len / 23);"
+        print "    }"
         print "    paired = false;"
         print "    hid_cid = 0;"
         print "    pairing_state = 0;"
@@ -243,7 +249,7 @@ if ! grep -q 'gap_discoverable_control.*nintendo_packet_handler\|re-enable disco
         print "                /* switch-bt-ws patch: HCI 再起動後も discoverable + connectable に */"
         print "                gap_discoverable_control(1);"
         print "                gap_connectable_control(1);"
-        print "                /* switch-bt-ws patch: 実際の BD_ADDR を reply02 / reply01_1 に書き込む */"
+        print "                /* switch-bt-ws patch: 実際の BD_ADDR を reply02 / reply01_1 / reply1060 に書き込む */"
         print "                {"
         print "                    bd_addr_t local_addr;"
         print "                    gap_local_bd_addr(local_addr);"
@@ -251,7 +257,16 @@ if ! grep -q 'gap_discoverable_control.*nintendo_packet_handler\|re-enable disco
         print "                    memcpy(reply02 + 20, local_addr, 6);"
         print "                    /* reply01_1 offset 17-22: SPI Flash の BD_ADDR */"
         print "                    memcpy(reply01_1 + 17, local_addr, 6);"
-        print "                    fprintf(stderr, \"[btkeyLib] BD_ADDR patched into reply02/reply01_1: %s\\n\", bd_addr_to_str(local_addr));"
+        print "                    /* reply1060 offset 21-26: SPI 0x6000 シリアル番号領域に BD_ADDR を書き込み */"
+        print "                    /* Switch はここを見てコントローラーを識別する */"
+        print "                    memcpy(reply1060 + 21, local_addr, 6);"
+        print "                    fprintf(stderr, \"[btkeyLib] BD_ADDR patched into reply02/reply01_1/reply1060: %s\\n\", bd_addr_to_str(local_addr));"
+        print "                }"
+        print "                /* switch-bt-ws patch: HCI_STATE_WORKING 後のリンクキー DB 状態確認 */"
+        print "                {"
+        print "                    uint8_t wk_buf[23 * 16];"
+        print "                    int wk_len = export_link_keys(wk_buf, sizeof(wk_buf));"
+        print "                    fprintf(stderr, \"[btkeyLib] HCI_STATE_WORKING: link key DB has %d entries\\n\", wk_len / 23);"
         print "                }"
         patched_discoverable = 1
         next
@@ -374,15 +389,11 @@ if ! grep -q 'gap_discoverable_control.*do_sync' "$BTKEYLIB_C"; then
 fi
 
 # ---------------------------------------------------------------------------
-# パッチ 11: hid_report_data_callback のデバッグログ（削除済み）
+# パッチ 11: hid_report_data_callback のデバッグログ削除（無条件）
 # ---------------------------------------------------------------------------
-# 接続中に毎フレーム大量出力されるため削除。
-# 既に適用済みの場合はログ行を取り除く。
-if grep -q 'fprintf.*stderr.*hid_report_data_callback.*report_id' "$BTKEYLIB_C" \
-   || grep -q '\[btkeyLib\] hid_report:' "$BTKEYLIB_C"; then
-    sed -i '/fprintf(stderr, "\[btkeyLib\] hid_report:/d' "$BTKEYLIB_C"
-    echo "[patch] btkeyLib.c: hid_report デバッグログを削除"
-fi
+# 接続中に毎フレーム大量出力されるため削除。無条件で実行（既に削除済みでも無害）。
+sed -i '/fprintf(stderr, "\[btkeyLib\] hid_report:/d' "$BTKEYLIB_C"
+echo "[patch] btkeyLib.c: hid_report デバッグログを削除"
 
 # ---------------------------------------------------------------------------
 # パッチ 12: CAN_SEND_NOW にデバッグログ（初回のみ）
@@ -523,7 +534,7 @@ if ! grep -q 'switch-bt-ws patch: capture link key' "$BTKEYLIB_C"; then
         print ""
         added_lk_include = 1
     }
-    # BTSTACK_EVENT_STATE case の前に HCI_EVENT_LINK_KEY_NOTIFICATION case を挿入
+    # BTSTACK_EVENT_STATE case の前に HCI イベントハンドラを挿入
     /case BTSTACK_EVENT_STATE:/ && !patched_lk {
         print "            case HCI_EVENT_LINK_KEY_NOTIFICATION:  /* switch-bt-ws patch: capture link key */"
         print "            {"
@@ -540,6 +551,24 @@ if ! grep -q 'switch-bt-ws patch: capture link key' "$BTKEYLIB_C"; then
         print "                    lk_db->put_link_key(lk_addr, lk_key, lk_type);"
         print "                    fprintf(stderr, \"[btkeyLib] link key stored in memory DB\\n\");"
         print "                }"
+        print "                break;"
+        print "            }"
+        print "            case HCI_EVENT_LINK_KEY_REQUEST:  /* switch-bt-ws patch: debug link key request */"
+        print "            {"
+        print "                bd_addr_t req_addr;"
+        print "                hci_event_link_key_request_get_bd_addr(packet, req_addr);"
+        print "                const btstack_link_key_db_t *req_db = btstack_link_key_db_memory_instance();"
+        print "                link_key_t found_key;"
+        print "                link_key_type_t found_type;"
+        print "                int found = req_db->get_link_key(req_addr, found_key, &found_type);"
+        print "                fprintf(stderr, \"[btkeyLib] LINK_KEY_REQUEST: addr=%s found=%d\\n\","
+        print "                        bd_addr_to_str(req_addr), found);"
+        print "                break;  /* BTStack の HCI レイヤーが自動応答する */"
+        print "            }"
+        print "            case HCI_EVENT_CONNECTION_COMPLETE:  /* switch-bt-ws patch: debug connection */"
+        print "            {"
+        print "                uint8_t conn_status = packet[2];"
+        print "                fprintf(stderr, \"[btkeyLib] CONNECTION_COMPLETE: status=0x%02x\\n\", conn_status);"
         print "                break;"
         print "            }"
         patched_lk = 1

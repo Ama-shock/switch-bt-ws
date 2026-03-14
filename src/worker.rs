@@ -23,9 +23,9 @@ use crate::ipc::{WorkerCommand, WorkerEvent};
 /// ワーカーモードのメイン関数。
 /// 引数: ["--worker", id, vid_hex, pid_hex, instance_str]
 pub fn run(args: &[String]) {
-    // args: [exe, "--worker", id, vid_hex, pid_hex, instance]
+    // args: [exe, "--worker", id, vid_hex, pid_hex, instance, [--link-keys, base64]]
     if args.len() < 6 {
-        eprintln!("[worker] 使用方法: --worker <id> <vid_hex> <pid_hex> <instance>");
+        eprintln!("[worker] 使用方法: --worker <id> <vid_hex> <pid_hex> <instance> [--link-keys <base64>]");
         std::process::exit(1);
     }
 
@@ -33,13 +33,25 @@ pub fn run(args: &[String]) {
     let pid = u16::from_str_radix(&args[4], 16).unwrap_or(0);
     let instance: i32 = args[5].parse().unwrap_or(0);
 
-    eprintln!("[worker:{vid:04x}:{pid:04x}] 起動 instance={instance}");
+    // --link-keys オプションの解析
+    let init_link_keys = args.windows(2)
+        .find(|w| w[0] == "--link-keys")
+        .and_then(|w| base64::engine::general_purpose::STANDARD.decode(&w[1]).ok());
+
+    eprintln!("[worker:{vid:04x}:{pid:04x}] 起動 instance={instance} link_keys={}",
+        init_link_keys.as_ref().map_or("none".to_string(), |k| format!("{} bytes", k.len())));
 
     // ペアリングループ中かどうか
     let syncing = Arc::new(AtomicBool::new(false));
 
     // ターゲットドングルを設定
     btstack::set_target(vid, pid, instance);
+
+    // リンクキーを BTStack 起動前にインポート（メモリ DB に事前格納）
+    if let Some(ref keys) = init_link_keys {
+        btstack::set_link_keys(keys);
+        eprintln!("[worker] link keys pre-imported before BTStack start");
+    }
 
     // BTStack スレッドを起動（シャットダウンまでブロック）
     std::thread::Builder::new()

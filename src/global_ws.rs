@@ -87,6 +87,12 @@ async fn handle_global_socket(socket: WebSocket, state: AppState) {
         }
     }
 
+    // 定期的にスナップショットを送信（3秒ごと）
+    let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(3));
+    sync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 初回は既に送信済みなのでスキップ
+    sync_interval.tick().await;
+
     loop {
         tokio::select! {
             result = event_rx.recv() => {
@@ -118,9 +124,37 @@ async fn handle_global_socket(socket: WebSocket, state: AppState) {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("グローバルWS: {n} メッセージ遅延");
+                        tracing::warn!("グローバルWS: {n} メッセージ遅延 → スナップショット再送");
+                        let devices = manager.get_cached_devices().await;
+                        let controllers = manager.list().await;
+                        let msg = ServerMsg::Snapshot {
+                            version: env!("CARGO_PKG_VERSION"),
+                            devices,
+                            controllers,
+                        };
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            if ws_tx.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+
+            // 定期スナップショット（コントローラー状態の同期保証）
+            _ = sync_interval.tick() => {
+                let devices = manager.get_cached_devices().await;
+                let controllers = manager.list().await;
+                let msg = ServerMsg::Snapshot {
+                    version: env!("CARGO_PKG_VERSION"),
+                    devices,
+                    controllers,
+                };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    if ws_tx.send(Message::Text(json)).await.is_err() {
+                        break;
+                    }
                 }
             }
 

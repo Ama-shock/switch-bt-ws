@@ -66,6 +66,10 @@ struct AddControllerRequest {
     pid: u16,
     #[serde(default)]
     instance: u32,
+    /// base64 エンコードされたリンクキー（再接続用）。
+    /// 指定時はワーカー起動前にインポートし、起動後に reconnect を実行する。
+    #[serde(default)]
+    link_keys: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -79,7 +83,7 @@ async fn api_controllers_add(
     State(state): State<AppState>,
     Json(req): Json<AddControllerRequest>,
 ) -> (StatusCode, Json<AddControllerResponse>) {
-    match state.controllers.add(req.vid, req.pid, req.instance).await {
+    match state.controllers.add(req.vid, req.pid, req.instance, req.link_keys).await {
         Ok(id) => (
             StatusCode::CREATED,
             Json(AddControllerResponse {

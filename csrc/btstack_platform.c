@@ -206,6 +206,8 @@ void import_link_keys(const uint8_t *buf, int len)
         memcpy(key, buf + i + 6, 16);
         link_key_type_t type = (link_key_type_t)buf[i + 22];
         db->put_link_key(addr, key, type);
+        fprintf(stderr, "[btstack] import_link_key: addr=%02x:%02x:%02x:%02x:%02x:%02x type=%d\n",
+                addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], type);
         count++;
     }
     fprintf(stderr, "[btstack] imported %d link key(s)\n", count);
