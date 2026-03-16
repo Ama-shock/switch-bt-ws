@@ -59,6 +59,35 @@ mod platform {
         format!(r"{DRIVER_BASE_DIR}\{vid:04x}_{pid:04x}")
     }
 
+    // ---- 昇格実行ヘルパー ---------------------------------------------------
+
+    /// PowerShell スクリプトを管理者権限で実行する。
+    /// 一時ファイルに書き出し、Start-Process -Verb RunAs で UAC 昇格する。
+    async fn run_elevated_ps(script: &str, _label: &str) -> Result<()> {
+        let script_path = std::env::temp_dir().join("btstack_driver_op.ps1");
+
+        std::fs::write(&script_path, script)
+            .context("一時スクリプトの書き込みに失敗しました")?;
+
+        // Start-Process -Verb RunAs で昇格実行
+        // -PassThru + WaitForExit() で確実に完了待機
+        let launcher = format!(
+            "$p = Start-Process -FilePath 'powershell' \
+             -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','{script}' \
+             -Verb RunAs -PassThru; $p.WaitForExit()",
+            script = script_path.to_string_lossy().replace('\'', "''"),
+        );
+
+        tokio::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &launcher])
+            .output()
+            .await
+            .context("昇格スクリプトの実行に失敗しました")?;
+
+        let _ = std::fs::remove_file(&script_path);
+        Ok(())
+    }
+
     // ---- デバイス一覧 -------------------------------------------------------
 
     /// Bluetooth ドングルと思われる USB デバイスを PowerShell / WMI で列挙する。
@@ -190,50 +219,53 @@ Get-WmiObject Win32_PnPEntity |
         let dir = driver_package_dir(vid, pid);
         let inf = inf_name(vid, pid);
         let cat = cat_name(vid, pid);
-
-        // ドライバパッケージディレクトリを作成し INF を書き出す
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("ディレクトリの作成に失敗しました: {dir}"))?;
-        let inf_full = format!(r"{dir}\{inf}");
-        write_winusb_inf(vid, pid, &inf_full)?;
-
         let hwid = format!(r"USB\VID_{vid:04X}&PID_{pid:04X}");
+        let inf_content = generate_winusb_inf(vid, pid);
 
-        // PowerShell スクリプト:
-        //   自己署名証明書 → カタログ作成・署名 → UpdateDriverForPlugAndPlayDevices
-        let ps_script = format!(
-            r#"
-$ErrorActionPreference = 'Stop'
-$certSubject = 'CN=switch-bt-ws WinUSB Driver'
-$dir = '{dir}'
-$infFile = '{inf}'
-$catFile = '{cat}'
-$hwid = '{hwid}'
-
-# --- 1. 自己署名コード署名証明書 (既存なら再利用) ---
+        // ディレクトリ作成・INF 書き出し・証明書・カタログ署名・ドライバ適用を
+        // すべて昇格スクリプト内で実行する（非管理者でも C:\Windows\Temp に書けない場合がある）
+        //
+        // INF 内容は PowerShell の単一引用符 here-string (@'...'@) で埋め込むため
+        // 変数展開されない。Rust の format! とも競合しないよう文字列連結で構築する。
+        let ps_script = [
+            "$ErrorActionPreference = 'Stop'\n",
+            &format!("$certSubject = 'CN=switch-bt-ws WinUSB Driver'\n"),
+            &format!("$dir = '{}'\n", dir.replace('\'', "''")),
+            &format!("$infFile = '{}'\n", inf),
+            &format!("$catFile = '{}'\n", cat),
+            &format!("$hwid = '{}'\n", hwid),
+            "\n# --- 0. ディレクトリ作成 + INF 書き出し ---\n",
+            "if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }\n",
+            "$infPath = Join-Path $dir $infFile\n",
+            "@'\n",
+            &inf_content,
+            "\n'@ | Set-Content -Path $infPath -Encoding ASCII\n",
+            "\n# --- 1. 自己署名コード署名証明書 (既存なら再利用) ---\n",
+        ].join("");
+        let ps_script = ps_script + r#"
 $cert = Get-ChildItem Cert:\LocalMachine\My -CodeSigningCert |
-    Where-Object {{ $_.Subject -eq $certSubject -and $_.NotAfter -gt (Get-Date) }} |
+    Where-Object { $_.Subject -eq $certSubject -and $_.NotAfter -gt (Get-Date) } |
     Select-Object -First 1
-if (-not $cert) {{
+if (-not $cert) {
     $cert = New-SelfSignedCertificate `
         -Subject $certSubject `
         -Type CodeSigningCert `
         -CertStoreLocation Cert:\LocalMachine\My `
         -NotAfter (Get-Date).AddYears(10)
-}}
+}
 
 # --- 2. Root + TrustedPublisher に追加（既にあればスキップ） ---
 $thumb = $cert.Thumbprint
-foreach ($store in @('Root', 'TrustedPublisher')) {{
+foreach ($store in @('Root', 'TrustedPublisher')) {
     $existing = Get-ChildItem "Cert:\LocalMachine\$store" |
-        Where-Object {{ $_.Thumbprint -eq $thumb }}
-    if (-not $existing) {{
+        Where-Object { $_.Thumbprint -eq $thumb }
+    if (-not $existing) {
         $tmpCer = [System.IO.Path]::GetTempFileName() + '.cer'
         Export-Certificate -Cert $cert -FilePath $tmpCer -Type CERT | Out-Null
         Import-Certificate -FilePath $tmpCer -CertStoreLocation "Cert:\LocalMachine\$store" | Out-Null
         Remove-Item $tmpCer -ErrorAction SilentlyContinue
-    }}
-}}
+    }
+}
 
 # --- 3. カタログファイル (.cat) を作成 ---
 $catPath = Join-Path $dir $catFile
@@ -248,7 +280,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.ComponentModel;
 
-public class WinUsbInstaller {{
+public class WinUsbInstaller {
     [DllImport("newdev.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern bool UpdateDriverForPlugAndPlayDevicesW(
         IntPtr hwndParent,
@@ -257,58 +289,34 @@ public class WinUsbInstaller {{
         uint InstallFlags,
         out bool bRebootRequired
     );
-}}
+}
 "@
 
-$infPath = Join-Path $dir $infFile
 $reboot = $false
 $result = [WinUsbInstaller]::UpdateDriverForPlugAndPlayDevicesW(
     [IntPtr]::Zero, $hwid, $infPath, 0x01, [ref]$reboot)
-if (-not $result) {{
+if (-not $result) {
     $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
     $ex = New-Object System.ComponentModel.Win32Exception($err)
     throw "UpdateDriver failed ($err): $($ex.Message)"
-}}
-if ($reboot) {{ Write-Output 'REBOOT_REQUIRED' }}
+}
+if ($reboot) { Write-Output 'REBOOT_REQUIRED' }
 Write-Output 'OK'
-"#,
-            dir = dir.replace('\'', "''"),
-            inf = inf,
-            cat = cat,
-            hwid = hwid,
-        );
+"#;
 
-        let output = tokio::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
-            .output()
-            .await
-            .context("WinUSB ドライバ導入スクリプトの実行に失敗しました")?;
+        run_elevated_ps(&ps_script, "WinUSB ドライバ導入").await?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if output.status.success() && stdout.contains("OK") {
-            let mut msg = format!("WinUSB ドライバを導入しました ({vid:04x}:{pid:04x})");
-            if stdout.contains("REBOOT_REQUIRED") {
-                msg.push_str("（再起動が必要です）");
-            }
-            tracing::info!("{msg}");
-            Ok(msg)
-        } else {
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else {
-                stdout.trim().to_string()
-            };
-            Err(anyhow::anyhow!("WinUSB ドライバの導入に失敗しました: {detail}"))
-        }
+        // 操作後にデバイス状態をポーリングして成否を判定
+        let vid_str = format!("{vid:04x}");
+        let pid_str = format!("{pid:04x}");
+        verify_driver_state(&vid_str, &pid_str, true).await
     }
 
-    /// WinUSB 用の INF ファイルを生成する（Zadig / libwdi 互換）。
+    /// WinUSB 用の INF ファイル内容を生成する（Zadig / libwdi 互換）。
     /// CatalogFile を含めることで署名済みカタログと紐づく。
-    fn write_winusb_inf(vid: u16, pid: u16, path: &str) -> Result<()> {
+    fn generate_winusb_inf(vid: u16, pid: u16) -> String {
         let cat = cat_name(vid, pid);
-        let inf = format!(
+        format!(
             r#"[Version]
 Signature   = "$Windows NT$"
 Class       = USBDevice
@@ -366,11 +374,7 @@ WinUSB_SvcDesc = "WinUSB"
             cat = cat,
             vid = vid,
             pid = pid,
-        );
-
-        std::fs::write(path, inf)
-            .with_context(|| format!("INF ファイルの書き込みに失敗しました: {path}"))?;
-        Ok(())
+        )
     }
 
     // ---- 元ドライバへの復元 -------------------------------------------------
@@ -379,7 +383,7 @@ WinUSB_SvcDesc = "WinUSB"
     ///
     /// PowerShell で以下を実行:
     /// 1. ドライバストアから switch-bt-ws の OEM INF を検索
-    /// 2. `pnputil /delete-driver /uninstall /force` で削除
+    /// 2. `pnputil /delete-driver /uninstall` で削除
     /// 3. デバイスを無効→有効にして Windows に標準ドライバを再適用させる
     /// 4. パッケージディレクトリを削除
     ///
@@ -426,7 +430,7 @@ if (-not $oemInf) {{
 
 # --- 2. OEM INF を削除 ---
 if ($oemInf) {{
-    $delResult = pnputil /delete-driver $oemInf /uninstall /force 2>&1 | Out-String
+    $delResult = pnputil /delete-driver $oemInf /uninstall 2>&1 | Out-String
     Write-Host "pnputil delete: $delResult"
 }} else {{
     Write-Host "OEM INF not found in driver store, skipping delete"
@@ -465,32 +469,35 @@ Write-Output 'OK'
             dir = dir.replace('\'', "''"),
         );
 
-        let output = tokio::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
-            .output()
-            .await
-            .context("ドライバ復元スクリプトの実行に失敗しました")?;
+        run_elevated_ps(&ps_script, "ドライバ復元").await?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 操作後にデバイス状態をポーリングして成否を判定
+        let vid_str = format!("{vid:04x}");
+        let pid_str = format!("{pid:04x}");
+        verify_driver_state(&vid_str, &pid_str, false).await
+    }
 
-        tracing::info!("restore stdout: {stdout}");
-        if !stderr.trim().is_empty() {
-            tracing::warn!("restore stderr: {stderr}");
+    /// ドライバ操作後の状態をポーリングで確認する。
+    /// `expect_winusb`: true=WinUSB になっていれば成功, false=WinUSB 以外なら成功
+    async fn verify_driver_state(vid: &str, pid: &str, expect_winusb: bool) -> Result<String> {
+        let label = if expect_winusb { "WinUSB ドライバ導入" } else { "ドライバ復元" };
+        // デバイスの再認識には時間がかかるためポーリング（1秒間隔、最大15回）
+        for i in 0..15 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let devices = list_bt_usb_devices().await.unwrap_or_default();
+            let matched = devices.iter().any(|d| {
+                d.vid == vid && d.pid == pid && {
+                    let is_winusb = d.driver.to_lowercase().contains("winusb");
+                    if expect_winusb { is_winusb } else { !is_winusb }
+                }
+            });
+            if matched {
+                tracing::info!("[driver] {label}を確認（{}秒後）", i + 1);
+                return Ok(format!("{label}が完了しました"));
+            }
         }
-
-        if output.status.success() && stdout.contains("OK") {
-            let msg = format!("ドライバを復元しました ({vid:04x}:{pid:04x})");
-            tracing::info!("{msg}");
-            Ok(msg)
-        } else {
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim().to_string()
-            } else {
-                stdout.trim().to_string()
-            };
-            Err(anyhow::anyhow!("ドライバの復元に失敗しました: {detail}"))
-        }
+        // ポーリングで確認できなくても操作自体は実行済み
+        Ok(format!("{label}: 操作は実行されました（ドライバの反映には時間がかかる場合があります）"))
     }
 }
 

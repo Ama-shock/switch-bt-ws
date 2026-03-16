@@ -4,4 +4,13 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
+      - .:/app
       - ./dist:/out
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/app/target
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:

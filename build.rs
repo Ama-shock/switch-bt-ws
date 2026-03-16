@@ -12,6 +12,14 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // ビルドごとに一意の識別子を生成（バイナリ識別用）
+    let build_id: u32 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_millis() % 0xFFFF) as u32)
+        .unwrap_or(0);
+    println!("cargo:rustc-env=BUILD_ID={:04X}", build_id);
+    // BUILD_ID は毎回変わるため常にbuild.rsを再実行させる
+    println!("cargo:rerun-if-changed=.build_trigger");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     if target_os != "windows" {

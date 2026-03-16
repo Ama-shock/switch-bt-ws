@@ -31,9 +31,18 @@ use crate::api::AppState;
 use crate::controller::ControllerManager;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_ID: &str = env!("BUILD_ID");
+const THIRD_PARTY_LICENSES: &str = include_str!("../csrc/THIRD_PARTY_LICENSES.txt");
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // --licenses フラグでサードパーティライセンスを表示して終了
+    if args.iter().any(|a| a == "--licenses") {
+        println!("switch-bt-ws v{VERSION}\n");
+        println!("{THIRD_PARTY_LICENSES}");
+        return Ok(());
+    }
 
     // --debug フラグがあれば RUST_LOG を debug に設定
     if args.iter().any(|a| a == "--debug") {
@@ -56,22 +65,9 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn print_banner() {
-    println!("switch-bt-ws v{VERSION}");
-    println!();
-    println!("This software uses BTStack:");
-    println!("  Copyright (C) 2009 BlueKitchen GmbH. All rights reserved.");
-    println!("  Redistribution and use in source and binary forms, with or without");
-    println!("  modification, are permitted provided that the following conditions are met:");
-    println!("  1. Redistributions of source code must retain the above copyright notice.");
-    println!("  2. Redistributions in binary form must reproduce the above copyright notice");
-    println!("     in the documentation and/or other materials provided with the distribution.");
-    println!("  3. Neither the name of the copyright holders nor the names of contributors");
-    println!("     may be used to endorse or promote products derived from this software");
-    println!("     without specific prior written permission.");
-    println!("  4. Any redistribution, use, or modification is done solely for personal");
-    println!("     benefit and not for any commercial purpose or for monetary gain.");
-    println!("  See https://github.com/bluekitchen/btstack/blob/master/LICENSE");
-    println!("      https://github.com/mizuyoukanao/btstack?tab=License-1-ov-file");
+    println!("switch-bt-ws v{VERSION} (build {BUILD_ID})");
+    println!("  Contains BTStack (C) BlueKitchen GmbH — BSD-3-Clause + Non-Commercial");
+    println!("  Run with --licenses for full third-party license information");
     println!();
 }
 
