@@ -49,7 +49,7 @@ fn compile_btstack() {
         panic!(
             "BTStack ルートが見つかりません: {:?}\n\
              環境変数 BTSTACK_ROOT を設定するか、Cargo.toml から見て ../windows に \
-             mizuyoukanao/btstack のクローンが必要です。\n\
+             bluekitchen/btstack のクローンが必要です。\n\
              Docker でビルドする場合は Dockerfile を使用してください。",
             btstack_root.canonicalize().unwrap_or(btstack_root)
         );
@@ -140,7 +140,9 @@ fn compile_btstack() {
     // -----------------------------------------------------------------------
 
     // Pro Controller エミュレーション本体
-    add_c_file(&mut build, &btstack_root.join("example/btkeyLib.c"));
+    // 元は mizuyoukanao/btstack の example/btkeyLib.c。
+    // パッチ適用済みの状態でリポジトリに直接保持する。
+    add_c_file(&mut build, Path::new("csrc/btkeyLib.c"));
 
     // プラットフォームラッパー
     // port/windows-winusb/main.c の改変版。
@@ -166,6 +168,7 @@ fn compile_btstack() {
     // -----------------------------------------------------------------------
     // 変更検知トリガー
     // -----------------------------------------------------------------------
+    println!("cargo:rerun-if-changed=csrc/btkeyLib.c");
     println!("cargo:rerun-if-changed=csrc/btstack_platform.c");
     println!("cargo:rerun-if-changed=csrc/btstack_stub.c");
     println!("cargo:rerun-if-changed=csrc/app.rc");

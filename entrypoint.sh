@@ -3,7 +3,8 @@ set -e
 
 cd /app
 
-# BTStack パッチの適用（常に最新パッチを適用するため git checkout で復元）
+# BTStack コアへのパッチ適用（hci_transport のみ）
+# btkeyLib.c は csrc/ にパッチ適用済みの状態で管理しているため対象外
 cd /btstack/windows && git checkout -- . && cd /app
 bash patches/apply_patches.sh /btstack/windows
 

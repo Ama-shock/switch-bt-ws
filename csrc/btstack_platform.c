@@ -109,8 +109,10 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
             fprintf(stderr, "[btstack] HCI working (#%d): BD_ADDR=%s off->on=%.1fms\n",
                     hci_cycle_count, bd_addr_to_str(local_addr), off_to_on_ms);
             /* 診断: HCI コントローラーの機能を確認 */
-            fprintf(stderr, "[btstack] BR/EDR supported: %d, LE supported: %d\n",
-                    hci_classic_supported(), hci_le_supported());
+#ifdef ENABLE_CLASSIC
+            /* hci_classic_supported() は v1.6+ のみ。v1.5.x では ENABLE_CLASSIC マクロで判定 */
+            fprintf(stderr, "[btstack] BR/EDR: enabled (ENABLE_CLASSIC)\n");
+#endif
 
             /* TLV ストレージを初期化（LE device DB が内部で使用）
              * ファイルパスに NUL を指定してディスク書き出しを無効化 */

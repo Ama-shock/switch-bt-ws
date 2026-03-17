@@ -34,12 +34,11 @@ RUN cd /usr/x86_64-w64-mingw32/include && \
 RUN rustup target add x86_64-pc-windows-gnu
 
 # ---------------------------------------------------------------------------
-# BTStack ソースの取得
+# BTStack ソースの取得 (bluekitchen/btstack upstream)
 # ---------------------------------------------------------------------------
 WORKDIR /btstack
-ARG BTSTACK_COMMIT=a843d07e2
-RUN git clone https://github.com/mizuyoukanao/btstack.git windows && \
-    git -C windows checkout ${BTSTACK_COMMIT}
+ARG BTSTACK_TAG=v1.5.3
+RUN git clone --depth 1 --branch ${BTSTACK_TAG} https://github.com/bluekitchen/btstack.git windows
 
 ENV BTSTACK_ROOT=/btstack/windows
 
