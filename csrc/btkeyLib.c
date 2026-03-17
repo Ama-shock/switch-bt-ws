@@ -3,6 +3,18 @@
  * @file	btkeyLib.c
  * @brief	Bluetoothアダプタをワイヤレスコントローラに偽装する
  * @date	2021.06.20
+ *
+ * Originally from: https://github.com/mizuyoukanao/btstack
+ * Author: mizuyoukanao
+ *
+ * This file has been modified by the switch-bt-ws project:
+ *   - Thread-safe reconnect/sync/disconnect via btstack_run_loop
+ *   - Active reconnection using hid_device_connect()
+ *   - Link key direct capture and memory DB storage
+ *   - SSP Just Works + bondable mode configuration
+ *   - Pairing state logging and diagnostics
+ *   - Player LED tracking
+ *   - HID connection failure auto-recovery
  */
  //==============================================================================================
 #ifndef _WIN32
