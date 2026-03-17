@@ -78,7 +78,8 @@ async fn handle_socket(socket: WebSocket, handle: Arc<ControllerHandle>) {
                         dispatch_client_message(&text, &handle, &mut ws_tx).await;
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        tracing::info!("WebSocket クライアント切断");
+                        tracing::info!("WebSocket クライアント切断 → Switch 切断");
+                        handle.send(WorkerCommand::Disconnect);
                         break;
                     }
                     Some(Ok(_)) => { /* バイナリ / ping / pong は無視 */ }
@@ -162,6 +163,9 @@ async fn dispatch_client_message<S>(
         }
         ClientMessage::SyncStop => {
             handle.send(WorkerCommand::SyncStop);
+        }
+        ClientMessage::Disconnect => {
+            handle.send(WorkerCommand::Disconnect);
         }
         ClientMessage::GetLinkKeys => {
             handle.send(WorkerCommand::GetLinkKeys);

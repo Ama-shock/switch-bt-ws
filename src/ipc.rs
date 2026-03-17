@@ -44,6 +44,8 @@ pub enum WorkerCommand {
     SyncStart,
     /// ペアリングループ停止。
     SyncStop,
+    /// Switch との HID 接続を切断する。
+    Disconnect,
     /// リンクキーをインポートする（base64 エンコード）。
     SetLinkKeys { data: String },
     /// リンクキーのエクスポートを要求する。

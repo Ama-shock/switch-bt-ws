@@ -74,6 +74,25 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
     (void)size;
 
     if (packet_type != HCI_EVENT_PACKET) return;
+
+    /* 診断: HCI コマンド完了イベントを監視 */
+    if (hci_event_packet_get_type(packet) == HCI_EVENT_COMMAND_COMPLETE) {
+        uint16_t opcode = hci_event_command_complete_get_command_opcode(packet);
+        uint8_t status = packet[5];
+        /* Write Scan Enable = 0x0C1A */
+        if (opcode == 0x0C1A) {
+            fprintf(stderr, "[btstack] HCI Write_Scan_Enable complete: status=0x%02x\n", status);
+        }
+        /* Write Class of Device = 0x0C24 */
+        if (opcode == 0x0C24) {
+            fprintf(stderr, "[btstack] HCI Write_Class_Of_Device complete: status=0x%02x\n", status);
+        }
+        /* Write Local Name = 0x0C13 */
+        if (opcode == 0x0C13) {
+            fprintf(stderr, "[btstack] HCI Write_Local_Name complete: status=0x%02x\n", status);
+        }
+    }
+
     if (hci_event_packet_get_type(packet) != BTSTACK_EVENT_STATE) return;
 
     switch (btstack_event_state_get_state(packet)) {
@@ -89,6 +108,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
             }
             fprintf(stderr, "[btstack] HCI working (#%d): BD_ADDR=%s off->on=%.1fms\n",
                     hci_cycle_count, bd_addr_to_str(local_addr), off_to_on_ms);
+            /* 診断: HCI コントローラーの機能を確認 */
+            fprintf(stderr, "[btstack] BR/EDR supported: %d, LE supported: %d\n",
+                    hci_classic_supported(), hci_le_supported());
 
             /* TLV ストレージを初期化（LE device DB が内部で使用）
              * ファイルパスに NUL を指定してディスク書き出しを無効化 */

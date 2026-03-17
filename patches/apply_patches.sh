@@ -256,6 +256,24 @@ if ! grep -q 'reconnect_gamepad' "$BTKEYLIB_C"; then
         print "    sync_callback_reg.callback = &do_sync_on_main;"
         print "    btstack_run_loop_execute_on_main_thread(&sync_callback_reg);"
         print "}"
+        print "static btstack_context_callback_registration_t disconnect_callback_reg;"
+        print ""
+        print "static void do_disconnect_on_main(void * context) {"
+        print "    (void)context;"
+        print "    if (hid_cid != 0) {"
+        print "        fprintf(stderr, \"[btkeyLib] do_disconnect: hid_cid=%d\\n\", hid_cid);"
+        print "        hid_device_disconnect(hid_cid);"
+        print "    } else {"
+        print "        fprintf(stderr, \"[btkeyLib] do_disconnect: not connected\\n\");"
+        print "    }"
+        print "}"
+        print ""
+        print "void EXPORT_API disconnect_gamepad()"
+        print "{"
+        print "    fprintf(stderr, \"[btkeyLib] disconnect_gamepad: queuing on main thread\\n\");"
+        print "    disconnect_callback_reg.callback = &do_disconnect_on_main;"
+        print "    btstack_run_loop_execute_on_main_thread(&disconnect_callback_reg);"
+        print "}"
         print "/* --- end switch-bt-ws patch --- */"
         print ""
         patched_reconnect = 1
@@ -344,13 +362,24 @@ if ! grep -q 'fprintf.*stderr.*HID_CONNECTION_OPENED' "$BTKEYLIB_C"; then
         print "                        fprintf(stderr, \"[btkeyLib] HID_CONNECTION_OPENED: hid_cid=%d\\n\", hid_cid);"
         next
     }
-    # HID_SUBEVENT_CONNECTION_OPENED: status チェック失敗時のログ
+    # HID_SUBEVENT_CONNECTION_OPENED: status チェック失敗時のログ + 自動リカバリ
     # "if (status)" の次の行の "{" の中にログを挿入
     /hid_subevent_connection_opened_get_status/ { found_status = 1 }
     found_status && /if \(status\)/ { found_if_status = 1 }
     found_if_status && /\{/ && !added_fail_log {
         print $0
-        print "                            fprintf(stderr, \"[btkeyLib] HID_CONNECTION_OPENED_FAILED: status=%d\\n\", status);"
+        print "                            fprintf(stderr, \"[btkeyLib] HID_CONNECTION_OPENED_FAILED: status=%d (0x%02x)\\n\", status, status);"
+        print "                            /* switch-bt-ws patch: baseband disconnect (0x6A) = リンクキー不一致 */"
+        print "                            /* リンクキーを削除してペアリングモードに自動移行 */"
+        print "                            if (status == 0x6A) {"
+        print "                                fprintf(stderr, \"[btkeyLib] baseband disconnect → delete link keys + re-sync\\n\");"
+        print "                                gap_delete_all_link_keys();"
+        print "                                hid_cid = 0;"
+        print "                                pairing_state = 0;"
+        print "                                pending_active_connect = false;"
+        print "                                hci_power_control(HCI_POWER_OFF);"
+        print "                                hci_power_control(HCI_POWER_ON);"
+        print "                            }"
         added_fail_log = 1
         found_status = 0
         found_if_status = 0

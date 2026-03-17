@@ -118,6 +118,9 @@ pub enum ClientMessage {
     /// ペアリングループ停止。
     SyncStop,
 
+    /// Switch との HID 接続を切断する。
+    Disconnect,
+
     /// リンクキーのエクスポートを要求する。
     GetLinkKeys,
 }

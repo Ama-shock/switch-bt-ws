@@ -232,6 +232,10 @@ fn handle_command(cmd: WorkerCommand, syncing: &Arc<AtomicBool>) {
             eprintln!("[worker] pairing: stop");
             syncing.store(false, Ordering::Relaxed);
         }
+        WorkerCommand::Disconnect => {
+            eprintln!("[worker] disconnect");
+            btstack::disconnect();
+        }
         WorkerCommand::Shutdown => {
             syncing.store(false, Ordering::Relaxed);
             btstack::shutdown();

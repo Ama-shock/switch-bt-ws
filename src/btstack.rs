@@ -76,6 +76,10 @@ extern "C" {
     /// apply_patches.sh によって btkeyLib.c に追加された関数。
     fn sync_gamepad();
 
+    /// Switch との HID 接続を切断する。
+    /// apply_patches.sh によって btkeyLib.c に追加された関数。
+    fn disconnect_gamepad();
+
     /// VID/PID+インスタンス番号でターゲット USB ドングルを指定する。
     /// apply_patches.sh によって hci_transport_h2_winusb.c に追加された関数。
     /// 非 Windows では btstack_stub.c の空スタブが使われる。
@@ -170,6 +174,11 @@ pub fn reconnect() {
 /// リンクキーを全削除して新規ペアリングモードに入る（シンクロボタン長押し相当）。
 pub fn sync() {
     unsafe { sync_gamepad() }
+}
+
+/// Switch との HID 接続を切断する。
+pub fn disconnect() {
+    unsafe { disconnect_gamepad() }
 }
 
 /// Amiibo の `.bin` ダンプファイルを読み込んで送信する。
