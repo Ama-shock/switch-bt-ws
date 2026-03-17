@@ -191,7 +191,8 @@ fn handle_command(cmd: WorkerCommand, syncing: &Arc<AtomicBool>) {
                     eprintln!("[worker] pairing: discoverable, waiting for Switch...");
 
                     // HCI OFF→ON がスキャン窓と合わない場合があるため定期的にリトライ
-                    const RETRY_INTERVAL_TICKS: u32 = 75; // 15秒 (200ms × 75)
+                    // 間隔が短いと接続試行中にリセットしてしまうため 60 秒に設定
+                    const RETRY_INTERVAL_TICKS: u32 = 300; // 60秒 (200ms × 300)
 
                     let mut tick = 0u32;
                     loop {

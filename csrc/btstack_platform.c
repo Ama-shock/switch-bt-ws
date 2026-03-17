@@ -51,6 +51,11 @@ static btstack_packet_callback_registration_t hci_event_callback_registration;
 static bd_addr_t             local_addr;
 static bool                  shutdown_triggered;
 
+/* 診断: HCI 状態遷移タイミング */
+static LARGE_INTEGER          perf_freq;
+static LARGE_INTEGER          hci_off_time;
+static int                    hci_cycle_count = 0;
+
 /* TLV インスタンス（LE device DB 用） */
 static const btstack_tlv_t             *btstack_tlv_impl;
 static btstack_tlv_windows_t            btstack_tlv_context;
@@ -73,8 +78,17 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
 
     switch (btstack_event_state_get_state(packet)) {
         case HCI_STATE_WORKING:
+        {
+            hci_cycle_count++;
             gap_local_bd_addr(local_addr);
-            fprintf(stderr, "[btstack] HCI working: BD_ADDR=%s\n", bd_addr_to_str(local_addr));
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double off_to_on_ms = 0;
+            if (hci_off_time.QuadPart > 0 && perf_freq.QuadPart > 0) {
+                off_to_on_ms = (double)(now.QuadPart - hci_off_time.QuadPart) * 1000.0 / perf_freq.QuadPart;
+            }
+            fprintf(stderr, "[btstack] HCI working (#%d): BD_ADDR=%s off->on=%.1fms\n",
+                    hci_cycle_count, bd_addr_to_str(local_addr), off_to_on_ms);
 
             /* TLV ストレージを初期化（LE device DB が内部で使用）
              * ファイルパスに NUL を指定してディスク書き出しを無効化 */
@@ -87,8 +101,11 @@ static void packet_handler(uint8_t packet_type, uint16_t channel,
 #endif
             le_device_db_tlv_configure(btstack_tlv_impl, &btstack_tlv_context);
             break;
+        }
 
         case HCI_STATE_OFF:
+            QueryPerformanceCounter(&hci_off_time);
+            fprintf(stderr, "[btstack] HCI OFF (cycle #%d)\n", hci_cycle_count);
             if (!shutdown_triggered) break;
             btstack_stdin_reset();
             log_info("BTStack shutdown complete");
@@ -120,10 +137,12 @@ void hal_led_toggle(void)
 
 static void btstack_platform_run(void)
 {
-    /* ログ行がすぐに表示されるよう標準出力のバッファリングを無効化 */
+    /* ログ行がすぐに表示されるよう標準出力/エラーのバッファリングを無効化 */
     setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
 
     fprintf(stderr, "[btstack] platform starting\n");
+    QueryPerformanceFrequency(&perf_freq);
 
     /* コア初期化 */
     btstack_memory_init();

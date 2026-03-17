@@ -3,11 +3,9 @@ set -e
 
 cd /app
 
-# BTStack パッチの適用（既に適用済みならスキップ）
-if [ ! -f /btstack/.patched ]; then
-    bash patches/apply_patches.sh /btstack/windows
-    touch /btstack/.patched
-fi
+# BTStack パッチの適用（常に最新パッチを適用するため git checkout で復元）
+cd /btstack/windows && git checkout -- . && cd /app
+bash patches/apply_patches.sh /btstack/windows
 
 # サードパーティライセンス生成
 bash scripts/gen_licenses.sh > csrc/THIRD_PARTY_LICENSES.txt

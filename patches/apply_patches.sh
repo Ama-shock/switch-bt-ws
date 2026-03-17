@@ -89,22 +89,35 @@ skip_open && /HeapFree/ {
     print "                sprintf(vid_pid_match, \"\\\\\\\\?\\\\usb#vid_%04x&pid_%04x\","
     print "                        (unsigned)usb_target_vid, (unsigned)usb_target_pid);"
     print "                if (strncmp(DevIntfDetailData->DevicePath, vid_pid_match, strlen(vid_pid_match)) == 0) {"
-    print "                    static int match_count = 0;"
-    print "                    if (match_count == usb_target_instance) {"
-    print "                        do_try = 1;"
+    print "                    /* \u30c7\u30d0\u30a4\u30b9\u304c\u5b9f\u969b\u306b\u30aa\u30fc\u30d7\u30f3\u3067\u304d\u308b\u304b\u30d7\u30ed\u30fc\u30d6 */"
+    print "                    HANDLE hProbe = CreateFileA(DevIntfDetailData->DevicePath,"
+    print "                        GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,"
+    print "                        NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);"
+    print "                    if (hProbe != INVALID_HANDLE_VALUE) {"
+    print "                        CloseHandle(hProbe);"
+    print "                        static int opened_count = 0;"
+    print "                        fprintf(stderr, \"[usb_open] VID/PID match #%d: %s\\n\","
+    print "                                opened_count, DevIntfDetailData->DevicePath);"
+    print "                        if (opened_count == usb_target_instance) {"
+    print "                            do_try = 1;"
+    print "                        }"
+    print "                        opened_count++;"
+    print "                    } else {"
+    print "                        fprintf(stderr, \"[usb_open] VID/PID match but open failed (err=%lu), skipping: %s\\n\","
+    print "                                GetLastError(), DevIntfDetailData->DevicePath);"
     print "                    }"
-    print "                    match_count++;"
     print "                }"
     print "            }"
     print "            BOOL result = FALSE;"
     print "            if (do_try) {"
     print "                result = usb_try_open_device(DevIntfDetailData->DevicePath);"
     print "                if (result) {"
-    print "                    log_info(\"usb_open: Device opened (vid=%04x pid=%04x inst=%d), stop scanning\","
+    print "                    fprintf(stderr, \"[usb_open] Device opened (vid=%04x pid=%04x inst=%d)\\n\","
     print "                             usb_target_vid, usb_target_pid, usb_target_instance);"
     print "                    r = 0;"
     print "                } else {"
-    print "                    log_error(\"usb_open: Device open failed\");"
+    print "                    fprintf(stderr, \"[usb_open] Device open FAILED (vid=%04x pid=%04x inst=%d)\\n\","
+    print "                             usb_target_vid, usb_target_pid, usb_target_instance);"
     print "                }"
     print "            }"
     print "        }"  # SetupDiGetDeviceInterfaceDetail ブロック閉じ
@@ -175,13 +188,32 @@ if ! grep -q 'reconnect_gamepad' "$BTKEYLIB_C"; then
         print "static btstack_context_callback_registration_t reconnect_callback_reg;"
         print "static btstack_context_callback_registration_t sync_callback_reg;"
         print ""
+        print "/* 能動的再接続用: HCI_STATE_WORKING 後に hid_device_connect() を呼ぶためのフラグ */"
+        print "static bool pending_active_connect = false;"
+        print "static bd_addr_t reconnect_target_addr;"
+        print ""
         print "static void do_reconnect_on_main(void * context) {"
         print "    (void)context;"
-        print "    /* リンクキー DB の状態を確認（export_link_keys 経由） */"
-        print "    {"
-        print "        uint8_t chk_buf[23 * 16];"
-        print "        int chk_len = export_link_keys(chk_buf, sizeof(chk_buf));"
-        print "        fprintf(stderr, \"[btkeyLib] do_reconnect: link key DB has %d entries before HCI cycle\\n\", chk_len / 23);"
+        print "    /* リンクキー DB から接続先 BD_ADDR を取得 */"
+        print "    const btstack_link_key_db_t *db = btstack_link_key_db_memory_instance();"
+        print "    btstack_link_key_iterator_t it;"
+        print "    bd_addr_t target_addr;"
+        print "    link_key_t key;"
+        print "    link_key_type_t type;"
+        print "    bool found = false;"
+        print "    if (db->iterator_init(&it)) {"
+        print "        if (db->iterator_get_next(&it, target_addr, key, &type)) {"
+        print "            found = true;"
+        print "        }"
+        print "        db->iterator_done(&it);"
+        print "    }"
+        print "    if (found) {"
+        print "        fprintf(stderr, \"[btkeyLib] do_reconnect: target=%s (active connect after HCI cycle)\\n\", bd_addr_to_str(target_addr));"
+        print "        memcpy(reconnect_target_addr, target_addr, 6);"
+        print "        pending_active_connect = true;"
+        print "    } else {"
+        print "        fprintf(stderr, \"[btkeyLib] do_reconnect: no link keys, falling back to discoverable\\n\");"
+        print "        pending_active_connect = false;"
         print "    }"
         print "    paired = false;"
         print "    hid_cid = 0;"
@@ -267,6 +299,17 @@ if ! grep -q 'gap_discoverable_control.*nintendo_packet_handler\|re-enable disco
         print "                    uint8_t wk_buf[23 * 16];"
         print "                    int wk_len = export_link_keys(wk_buf, sizeof(wk_buf));"
         print "                    fprintf(stderr, \"[btkeyLib] HCI_STATE_WORKING: link key DB has %d entries\\n\", wk_len / 23);"
+        print "                }"
+        print "                /* switch-bt-ws patch: 能動的再接続 — リンクキーがあれば Switch に接続を開始 */"
+        print "                if (pending_active_connect) {"
+        print "                    pending_active_connect = false;"
+        print "                    uint16_t new_hid_cid = 0;"
+        print "                    uint8_t status = hid_device_connect(reconnect_target_addr, &new_hid_cid);"
+        print "                    fprintf(stderr, \"[btkeyLib] hid_device_connect(%s): status=0x%02x hid_cid=%d\\n\","
+        print "                            bd_addr_to_str(reconnect_target_addr), status, new_hid_cid);"
+        print "                    if (status == ERROR_CODE_SUCCESS) {"
+        print "                        hid_cid = new_hid_cid;"
+        print "                    }"
         print "                }"
         patched_discoverable = 1
         next
@@ -577,6 +620,43 @@ if ! grep -q 'switch-bt-ws patch: capture link key' "$BTKEYLIB_C"; then
     ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
     mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
     echo "[patch] btkeyLib.c: HCI_EVENT_LINK_KEY_NOTIFICATION でリンクキーを直接メモリ DB に格納"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 17: pairing_state 全遷移ログ
+# ---------------------------------------------------------------------------
+# pairing_state への代入すべてにログを追加する。
+# ただし既にログ付きの箇所（switch-bt-ws patch コメント付近）は除外。
+if ! grep -q 'PAIRING_STATE_CHANGE' "$BTKEYLIB_C"; then
+    sed -i 's/pairing_state = \([0-9]\{1,2\}\);/pairing_state = \1; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d\\n", pairing_state);/g' "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: pairing_state 全遷移ログを追加"
+fi
+
+# ---------------------------------------------------------------------------
+# パッチ 18: hid_report_data_callback でサブコマンド ID をログ
+# ---------------------------------------------------------------------------
+# Switch が送信するサブコマンドの ID (report[9]) をログ出力する。
+# 毎フレームではなく、値が変化した時のみ出力。
+if ! grep -q 'HID_REPORT_SUBCMD' "$BTKEYLIB_C"; then
+    awk '
+    /void hid_report_data_callback/ && !patched_subcmd {
+        print $0
+        print "{"
+        print "    /* switch-bt-ws patch: log subcommand changes */"
+        print "    static uint8_t last_subcmd = 0xFF;"
+        print "    if (report_id == 1 && report_size > 9 && report[9] != last_subcmd) {"
+        print "        fprintf(stderr, \"[btkeyLib] HID_REPORT_SUBCMD: id=0x%02x sub=0x%02x (0x%02x) size=%d pairing_state=%d\\n\","
+        print "                report_id, report[9], report_size > 10 ? report[10] : 0, report_size, pairing_state);"
+        print "        last_subcmd = report[9];"
+        print "    }"
+        patched_subcmd = 1
+        getline  # skip the original opening brace
+        next
+    }
+    { print }
+    ' "$BTKEYLIB_C" > "${BTKEYLIB_C}.tmp"
+    mv "${BTKEYLIB_C}.tmp" "$BTKEYLIB_C"
+    echo "[patch] btkeyLib.c: hid_report_data_callback にサブコマンドログを追加"
 fi
 
 echo "[patch] 全パッチの適用が完了しました。"
