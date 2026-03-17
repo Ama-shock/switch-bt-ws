@@ -369,10 +369,10 @@ if ! grep -q 'fprintf.*stderr.*HID_CONNECTION_OPENED' "$BTKEYLIB_C"; then
     found_if_status && /\{/ && !added_fail_log {
         print $0
         print "                            fprintf(stderr, \"[btkeyLib] HID_CONNECTION_OPENED_FAILED: status=%d (0x%02x)\\n\", status, status);"
-        print "                            /* switch-bt-ws patch: baseband disconnect (0x6A) = リンクキー不一致 */"
-        print "                            /* リンクキーを削除してペアリングモードに自動移行 */"
-        print "                            if (status == 0x6A) {"
-        print "                                fprintf(stderr, \"[btkeyLib] baseband disconnect → delete link keys + re-sync\\n\");"
+        print "                            /* switch-bt-ws patch: リンクキー不一致/認証失敗時の自動リカバリ */"
+        print "                            /* 0x6A=baseband disconnect, 0x66=security refused */"
+        print "                            if (status == 0x6A || status == 0x66) {"
+        print "                                fprintf(stderr, \"[btkeyLib] auth failure (0x%02x) → delete link keys + re-sync\\n\", status);"
         print "                                gap_delete_all_link_keys();"
         print "                                hid_cid = 0;"
         print "                                pairing_state = 0;"
@@ -623,6 +623,8 @@ if ! grep -q 'switch-bt-ws patch: capture link key' "$BTKEYLIB_C"; then
         print "                    lk_db->put_link_key(lk_addr, lk_key, lk_type);"
         print "                    fprintf(stderr, \"[btkeyLib] link key stored in memory DB\\n\");"
         print "                }"
+        print "                /* リンクキー交換後の接続先アドレスを記憶（再接続用） */"
+        print "                memcpy(reconnect_target_addr, lk_addr, 6);"
         print "                break;"
         print "            }"
         print "            case HCI_EVENT_LINK_KEY_REQUEST:  /* switch-bt-ws patch: debug link key request */"
