@@ -65,7 +65,7 @@ pub enum WorkerEvent {
     /// ワーカーの準備が完了した（BTStack 初期化済み）。
     Ready,
     /// 定期的なステータス更新。
-    Status { paired: bool, rumble: bool, syncing: bool, player: u8 },
+    Status { paired: bool, rumble: bool, rumble_left: u8, rumble_right: u8, syncing: bool, player: u8 },
     /// ワーカーがシャットダウンした。
     Shutdown,
     /// リンクキーデータ（base64 エンコード）。ペアリング成功時に自動送信。

@@ -60,6 +60,12 @@ extern "C" {
     /// Switch が現在振動を要求しているなら true。
     fn get_rumble() -> bool;
 
+    /// 左モーターの振動強度 (0〜255)。
+    fn get_rumble_intensity_left() -> u8;
+
+    /// 右モーターの振動強度 (0〜255)。
+    fn get_rumble_intensity_right() -> u8;
+
     /// 振動中に押し続けるボタンのビットマスクを登録する。
     #[link_name = "rumble_register"]
     fn ffi_rumble_register(key: u32);
@@ -159,6 +165,11 @@ pub fn set_pad_color(pad: u32, btn: u32, lg: u32, rg: u32) {
 /// Switch が現在振動を要求しているなら `true` を返す。
 pub fn get_rumble_state() -> bool {
     unsafe { get_rumble() }
+}
+
+/// 振動の強度を (left, right) で返す。各 0〜255。
+pub fn get_rumble_intensity() -> (u8, u8) {
+    unsafe { (get_rumble_intensity_left(), get_rumble_intensity_right()) }
 }
 
 /// 振動イベント時に押下するボタンのビットマスクを登録する。

@@ -33,6 +33,8 @@ enum ServerMsg {
         id: u32,
         paired: bool,
         rumble: bool,
+        rumble_left: u8,
+        rumble_right: u8,
         syncing: bool,
         player: u8,
     },
@@ -108,8 +110,8 @@ async fn handle_global_socket(socket: WebSocket, state: AppState) {
                                     controllers,
                                 })
                             }
-                            GlobalEvent::ControllerStatus { id, paired, rumble, syncing, player } => {
-                                Some(ServerMsg::ControllerStatus { id, paired, rumble, syncing, player })
+                            GlobalEvent::ControllerStatus { id, paired, rumble, rumble_left, rumble_right, syncing, player } => {
+                                Some(ServerMsg::ControllerStatus { id, paired, rumble, rumble_left, rumble_right, syncing, player })
                             }
                             GlobalEvent::ControllerLinkKeys { id, vid, pid, instance, data } => {
                                 Some(ServerMsg::ControllerLinkKeys { id, vid, pid, instance, data })

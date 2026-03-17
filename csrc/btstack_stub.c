@@ -19,6 +19,8 @@ void  send_accel(short x, short y, short z)                            { (void)x
 void  send_padcolor(unsigned int a, unsigned int b,
                     unsigned int c, unsigned int d)                    { (void)a; (void)b; (void)c; (void)d; }
 bool  get_rumble(void)                                                  { return false; }
+unsigned char get_rumble_intensity_left(void)                            { return 0; }
+unsigned char get_rumble_intensity_right(void)                           { return 0; }
 void  rumble_register(unsigned int key)                                { (void)key; }
 void  send_amiibo(const char *path)                                    { (void)path; }
 void  reconnect_gamepad(void)                                          {}

@@ -101,9 +101,12 @@ pub fn run(args: &[String]) {
 
                 prev_paired = paired;
 
+                let (rl, rr) = btstack::get_rumble_intensity();
                 let event = WorkerEvent::Status {
                     paired,
                     rumble: btstack::get_rumble_state(),
+                    rumble_left: rl,
+                    rumble_right: rr,
                     syncing: syncing_status.load(Ordering::Relaxed),
                     player: btstack::get_player_number(),
                 };

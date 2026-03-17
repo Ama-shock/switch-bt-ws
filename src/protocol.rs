@@ -138,6 +138,10 @@ pub enum ServerMessage {
         paired: bool,
         /// Switch が現在振動を要求しているなら true。
         rumble: bool,
+        /// 左モーター振動強度（0〜255）。
+        rumble_left: u8,
+        /// 右モーター振動強度（0〜255）。
+        rumble_right: u8,
         /// ペアリングループ中か。
         syncing: bool,
         /// Switch が割り当てたプレイヤー番号（1〜4）。未割当なら 0。

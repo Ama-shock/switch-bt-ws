@@ -38,6 +38,8 @@ pub enum GlobalEvent {
         id: u32,
         paired: bool,
         rumble: bool,
+        rumble_left: u8,
+        rumble_right: u8,
         syncing: bool,
         player: u8,
     },
@@ -341,6 +343,7 @@ async fn stdout_reader(
     let mut reader = BufReader::new(stdout).lines();
     // 状態変化のみグローバルに通知するための前回値
     let mut prev_paired = false;
+    let mut prev_rumble = false;
     let mut prev_syncing = false;
     let mut prev_player = 0u8;
 
@@ -352,7 +355,7 @@ async fn stdout_reader(
         match serde_json::from_str::<WorkerEvent>(&line) {
             Ok(event) => {
                 match &event {
-                    WorkerEvent::Status { paired, rumble, syncing, player } => {
+                    WorkerEvent::Status { paired, rumble, rumble_left, rumble_right, syncing, player } => {
                         let mut s = state.write().await;
                         s.paired = *paired;
                         s.rumble = *rumble;
@@ -360,7 +363,7 @@ async fn stdout_reader(
                         s.player = *player;
 
                         // 意味のある変化時のみグローバルイベントを送信 + ログ
-                        if *paired != prev_paired || *syncing != prev_syncing || *player != prev_player {
+                        if *paired != prev_paired || *syncing != prev_syncing || *player != prev_player || *rumble != prev_rumble {
                             if *paired != prev_paired {
                                 tracing::info!(
                                     "[controller id={id}] paired: {} -> {}",
@@ -383,10 +386,13 @@ async fn stdout_reader(
                                 id,
                                 paired: *paired,
                                 rumble: *rumble,
+                                rumble_left: *rumble_left,
+                                rumble_right: *rumble_right,
                                 syncing: *syncing,
                                 player: *player,
                             });
                             prev_paired = *paired;
+                            prev_rumble = *rumble;
                             prev_syncing = *syncing;
                             prev_player = *player;
                         }

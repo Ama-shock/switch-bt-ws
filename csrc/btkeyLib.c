@@ -59,6 +59,10 @@ static uint8_t l2cap_sdp_service_buffer[600];
 
 #if __EnabledRumble
 bool rumble_flag = false;
+/* switch-bt-ws: 振動の強度 (0.0〜1.0 を 0〜255 にスケール) */
+/* left/right 各モーターの高周波・低周波振幅の最大値 */
+static uint8_t rumble_intensity_left = 0;
+static uint8_t rumble_intensity_right = 0;
 #endif
 
 //----------------------------------------------------------
@@ -679,6 +683,15 @@ bool EXPORT_API get_rumble()
 {
     return rumble_flag;
 }
+/* switch-bt-ws: 振動の強度を 0〜255 で返す */
+uint8_t EXPORT_API get_rumble_intensity_left()
+{
+    return rumble_intensity_left;
+}
+uint8_t EXPORT_API get_rumble_intensity_right()
+{
+    return rumble_intensity_right;
+}
 void EXPORT_API rumble_register(uint32_t key)
 {
     rumble_bflag = key;
@@ -1161,11 +1174,28 @@ static void hid_report_data_callback(uint16_t cid, hid_report_type_t report_type
 #endif
 
 #if __EnabledRumble
-    if (report_id == 16 && report[1] != 0 && report[2] != 1 && report[5] != 0 && report[6] != 1)
-    {
-        rumble_flag = true;
-    } else {
-        rumble_flag = false;
+    /* Switch rumble data format (output report 0x10):
+     * report[0]   = timer/counter
+     * report[1..4] = left motor  (high_freq[0:1], low_freq_amp[2:3])
+     * report[5..8] = right motor (high_freq[0:1], low_freq_amp[2:3])
+     *
+     * High-band amplitude: encoded in report[1] (bits 0-7) → upper bits are amplitude
+     * Low-band amplitude:  encoded in report[3] (bits 1-7) → amplitude
+     *
+     * Simplified extraction: take max of high/low band amplitude bytes as intensity.
+     */
+    if (report_id == 16) {
+        /* Left motor: max of high-band amp (byte 1 upper) and low-band amp (byte 3) */
+        uint8_t l_hi = (report[1] >> 1) & 0x7F;  /* high-band amp rough */
+        uint8_t l_lo = (report[3] >> 1) & 0x7F;   /* low-band amp rough */
+        rumble_intensity_left = (l_hi > l_lo ? l_hi : l_lo) << 1;
+
+        /* Right motor */
+        uint8_t r_hi = (report[5] >> 1) & 0x7F;
+        uint8_t r_lo = (report[7] >> 1) & 0x7F;
+        rumble_intensity_right = (r_hi > r_lo ? r_hi : r_lo) << 1;
+
+        rumble_flag = (rumble_intensity_left > 0 || rumble_intensity_right > 0);
     }
 #endif
 
