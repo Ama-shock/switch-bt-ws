@@ -148,6 +148,9 @@ pub enum ServerMessage {
         player: u8,
     },
 
+    /// 振動データの即時通知。
+    Rumble { left: u8, right: u8 },
+
     /// リンクキーデータ（base64）。ペアリング成功時に自動送信。
     /// ブラウザは IndexedDB にドングル ID をキーにして保存する。
     LinkKeys { data: String },

@@ -66,6 +66,8 @@ pub enum WorkerEvent {
     Ready,
     /// 定期的なステータス更新。
     Status { paired: bool, rumble: bool, rumble_left: u8, rumble_right: u8, syncing: bool, player: u8 },
+    /// 振動データの即時通知（C 側の rumble 受信時にリアルタイムで送信）。
+    Rumble { left: u8, right: u8 },
     /// ワーカーがシャットダウンした。
     Shutdown,
     /// リンクキーデータ（base64 エンコード）。ペアリング成功時に自動送信。

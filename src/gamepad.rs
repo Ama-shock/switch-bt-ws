@@ -152,7 +152,7 @@ pub fn axis_to_stick(v: f32) -> u32 {
 /// Web Gamepad の軸配列 `[左X, 左Y, 右X, 右Y]` を
 /// Switch の 12bit スティック値 `(左H, 左V, 右H, 右V)` に変換する。
 ///
-/// Web Gamepad の Y 軸は**上が負**（Switch と同じ向き）のため、追加の反転は不要です。
+/// Web Gamepad の Y 軸は「上=-1, 下=+1」だが Switch は「上=4095, 下=0」のため Y 軸を反転する。
 pub fn map_axes(axes: &[f32]) -> (u32, u32, u32, u32) {
     let get = |i: usize| axes.get(i).copied().unwrap_or(0.0);
 
@@ -163,16 +163,16 @@ pub fn map_axes(axes: &[f32]) -> (u32, u32, u32, u32) {
     if pre_mapped {
         (
             (get(0) as u32).min(4095),
-            (get(1) as u32).min(4095),
+            (4095u32.saturating_sub(get(1) as u32)).min(4095), // Y 反転
             (get(2) as u32).min(4095),
-            (get(3) as u32).min(4095),
+            (4095u32.saturating_sub(get(3) as u32)).min(4095), // Y 反転
         )
     } else {
         (
-            axis_to_stick(get(0)), // 左スティック 水平
-            axis_to_stick(get(1)), // 左スティック 垂直
-            axis_to_stick(get(2)), // 右スティック 水平
-            axis_to_stick(get(3)), // 右スティック 垂直
+            axis_to_stick(get(0)),  // 左スティック 水平
+            axis_to_stick(-get(1)), // 左スティック 垂直 (Y 反転)
+            axis_to_stick(get(2)),  // 右スティック 水平
+            axis_to_stick(-get(3)), // 右スティック 垂直 (Y 反転)
         )
     }
 }

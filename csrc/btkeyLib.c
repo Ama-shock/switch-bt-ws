@@ -1064,11 +1064,18 @@ static void hid_report_data_callback(uint16_t cid, hid_report_type_t report_type
 {
     /* switch-bt-ws patch: log subcommand changes */
     static uint8_t last_subcmd = 0xFF;
+    static uint16_t last_report_id = 0xFFFF;
     if (report_id == 1 && report_size > 9 && report[9] != last_subcmd) {
         fprintf(stderr, "[btkeyLib] HID_REPORT_SUBCMD: id=0x%02x sub=0x%02x (0x%02x) size=%d pairing_state=%d\n",
                 report_id, report[9], report_size > 10 ? report[10] : 0, report_size, pairing_state);
         last_subcmd = report[9];
     }
+    /* report_id が変わった時にログ（rumble=0x10 等を検出するため） */
+    if (report_id != 1 && report_id != last_report_id) {
+        fprintf(stderr, "[btkeyLib] HID_REPORT: id=0x%02x size=%d\n", report_id, report_size);
+        last_report_id = report_id;
+    }
+    if (report_id == 1) last_report_id = 0xFFFF; /* subcmd が来たらリセット */
     //デバッグ用
     //for (int i = 0; i < report_size; ++i) {
     //    printf("%x,", report[i]);
@@ -1217,14 +1224,19 @@ static void hid_report_data_callback(uint16_t cid, hid_report_type_t report_type
         // 4801
         pairing_state = 13; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d\n", pairing_state);
     }
-    if(report[9] == 48) { player_leds = report[10]; }  /* switch-bt-ws patch: capture player LED */
-    if(report_id == 1 && report[9] == 48 && report[10] == 1)
-    {
-        // 3001
-        //for (int i = 0; i < report_size; ++i) {
-        //printf("%x,", report[i]);
-        //}
-        pairing_state = 14; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d\n", pairing_state);
+    if(report[9] == 48) {
+        player_leds = report[10];  /* switch-bt-ws patch: capture player LED */
+        // subcmd 0x30 = Set Player Lights:
+        // handshake が完了して pairing_state==0 になった後は state を変えない。
+        // handshake 途中 (pairing_state != 0) または初回 (pairing_state == 0 で未完了) は state 14 に遷移。
+        if (pairing_state != 0) {
+            // handshake 途中: state 14 に遷移して完了させる
+            pairing_state = 14; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d (subcmd 0x30, LED=0x%02x)\n", pairing_state, report[10]);
+        } else if (!paired) {
+            // pairing_state==0 かつ未ペアリング: 初回の 0x30
+            pairing_state = 14; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d (subcmd 0x30, LED=0x%02x)\n", pairing_state, report[10]);
+        }
+        // paired かつ pairing_state==0: handshake 完了後の繰り返し 0x30 → 無視
     }
     if(report[9] == 33 && report[10] == 33)
     {
@@ -1276,18 +1288,42 @@ static void hid_report_data_callback(uint16_t cid, hid_report_type_t report_type
      *
      * Simplified extraction: take max of high/low band amplitude bytes as intensity.
      */
-    if (report_id == 16) {
-        /* Left motor: max of high-band amp (byte 1 upper) and low-band amp (byte 3) */
-        uint8_t l_hi = (report[1] >> 1) & 0x7F;  /* high-band amp rough */
-        uint8_t l_lo = (report[3] >> 1) & 0x7F;   /* low-band amp rough */
-        rumble_intensity_left = (l_hi > l_lo ? l_hi : l_lo) << 1;
+    if (report_id == 16 && report_size >= 9) {
+        /* デバッグ: rumble raw data */
+        static int rumble_log_count = 0;
+        if (rumble_log_count < 10) {
+            fprintf(stderr, "[btkeyLib] RUMBLE: %02x %02x %02x %02x | %02x %02x %02x %02x (size=%d)\n",
+                    report[1], report[2], report[3], report[4],
+                    report[5], report[6], report[7], report[8], report_size);
+            rumble_log_count++;
+        }
+        /* Left motor: high-band amp (byte 1 bit 1-7) と low-band amp (byte 3 bit 1-7) の max
+         * 各 7bit (0-127) を 0-255 にスケール (x2) */
+        uint8_t l_hi = (report[1] >> 1) & 0x7F;
+        uint8_t l_lo = (report[3] >> 1) & 0x7F;
+        uint8_t l_max = l_hi > l_lo ? l_hi : l_lo; /* 0-127 */
 
         /* Right motor */
         uint8_t r_hi = (report[5] >> 1) & 0x7F;
         uint8_t r_lo = (report[7] >> 1) & 0x7F;
-        rumble_intensity_right = (r_hi > r_lo ? r_hi : r_lo) << 1;
+        uint8_t r_max = r_hi > r_lo ? r_hi : r_lo; /* 0-127 */
+
+        /* 0-127 → 0-255 にスケール（リニア） */
+        rumble_intensity_left = (uint8_t)((l_max * 255) / 127);
+        rumble_intensity_right = (uint8_t)((r_max * 255) / 127);
 
         rumble_flag = (rumble_intensity_left > 0 || rumble_intensity_right > 0);
+
+        /* rumble 変化を即座に stdout (IPC) へ送信 */
+        {
+            static uint8_t prev_left = 0, prev_right = 0;
+            if (rumble_intensity_left != prev_left || rumble_intensity_right != prev_right) {
+                prev_left = rumble_intensity_left;
+                prev_right = rumble_intensity_right;
+                printf("{\"event\":\"rumble\",\"left\":%d,\"right\":%d}\n", rumble_intensity_left, rumble_intensity_right);
+                fflush(stdout);
+            }
+        }
     }
 #endif
 
@@ -1449,9 +1485,16 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                     case HID_SUBEVENT_CAN_SEND_NOW:
                     {
                         static int csn_log_count = 0;
+                        static int csn_state0_count = 0;
                         if (csn_log_count < 5) {
-                            fprintf(stderr, "[btkeyLib] CAN_SEND_NOW: pairing_state=%d hid_cid=%d\n", pairing_state, hid_cid);
+                            fprintf(stderr, "[btkeyLib] CAN_SEND_NOW: pairing_state=%d hid_cid=%d paired=%d btn=0x%06x\n",
+                                    pairing_state, hid_cid, paired, button_flg);
                             csn_log_count++;
+                        }
+                        /* state 0 で入力レポートを送り始めた瞬間を記録 */
+                        if (pairing_state == 0 && !use_3f_report && csn_state0_count == 0) {
+                            fprintf(stderr, "[btkeyLib] CAN_SEND_NOW: now sending 0x30 input reports\n");
+                            csn_state0_count = 1;
                         }
                     }
                     {
@@ -1607,6 +1650,8 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                         if (isop == false)
                         {
                             buffer[2] = ++tim;
+                            fprintf(stderr, "[btkeyLib] SEND_REPLY: pairing_state=%d report_id=0x%02x subcmd=0x%02x\n",
+                                    pairing_state, buffer[1], (sizeof(buffer) > 14) ? buffer[14] : 0);
                             hid_device_send_interrupt_message(hid_cid, buffer, sizeof(buffer));
                         }
                         //printf("pairing_state:%d\n", pairing_state);

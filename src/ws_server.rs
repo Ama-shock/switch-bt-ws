@@ -95,7 +95,18 @@ async fn handle_socket(socket: WebSocket, handle: Arc<ControllerHandle>) {
 
 fn worker_event_to_server_msg(event: WorkerEvent) -> Option<ServerMessage> {
     match event {
-        WorkerEvent::Status { paired, rumble, rumble_left, rumble_right, syncing, player } => Some(ServerMessage::Status { paired, rumble, rumble_left, rumble_right, syncing, player }),
+        WorkerEvent::Status { paired, rumble, rumble_left, rumble_right, syncing, player } => {
+            if rumble {
+                static RUMBLE_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                if now != RUMBLE_LOG.load(std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!("WS rumble: left={rumble_left} right={rumble_right}");
+                    RUMBLE_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Some(ServerMessage::Status { paired, rumble, rumble_left, rumble_right, syncing, player })
+        }
+        WorkerEvent::Rumble { left, right } => Some(ServerMessage::Rumble { left, right }),
         WorkerEvent::LinkKeys { data } => Some(ServerMessage::LinkKeys { data }),
         WorkerEvent::Error { message } => Some(ServerMessage::Error { message }),
         _ => None,
@@ -129,6 +140,19 @@ async fn dispatch_client_message<S>(
     match msg {
         ClientMessage::GamepadState { button_status, buttons, axes } => {
             let button_flags = button_status.unwrap_or_else(|| gamepad::map_buttons(&buttons));
+            // デバッグ: ボタン入力が来たことをログ（非ゼロの時のみ、頻度制限あり）
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if button_flags != 0 && now != LAST_LOG.load(Ordering::Relaxed) {
+                    tracing::debug!("gamepad_state: btn=0x{:06x} axes={:?}", button_flags, axes);
+                    LAST_LOG.store(now, Ordering::Relaxed);
+                }
+            }
             handle.send(WorkerCommand::Button { button_status: button_flags });
 
             let (lh, lv, rh, rv) = gamepad::map_axes(&axes);
