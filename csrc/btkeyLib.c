@@ -1064,18 +1064,11 @@ static void hid_report_data_callback(uint16_t cid, hid_report_type_t report_type
 {
     /* switch-bt-ws patch: log subcommand changes */
     static uint8_t last_subcmd = 0xFF;
-    static uint16_t last_report_id = 0xFFFF;
     if (report_id == 1 && report_size > 9 && report[9] != last_subcmd) {
         fprintf(stderr, "[btkeyLib] HID_REPORT_SUBCMD: id=0x%02x sub=0x%02x (0x%02x) size=%d pairing_state=%d\n",
                 report_id, report[9], report_size > 10 ? report[10] : 0, report_size, pairing_state);
         last_subcmd = report[9];
     }
-    /* report_id が変わった時にログ（rumble=0x10 等を検出するため） */
-    if (report_id != 1 && report_id != last_report_id) {
-        fprintf(stderr, "[btkeyLib] HID_REPORT: id=0x%02x size=%d\n", report_id, report_size);
-        last_report_id = report_id;
-    }
-    if (report_id == 1) last_report_id = 0xFFFF; /* subcmd が来たらリセット */
     //デバッグ用
     //for (int i = 0; i < report_size; ++i) {
     //    printf("%x,", report[i]);
@@ -1289,14 +1282,6 @@ static void hid_report_data_callback(uint16_t cid, hid_report_type_t report_type
      * Simplified extraction: take max of high/low band amplitude bytes as intensity.
      */
     if (report_id == 16 && report_size >= 9) {
-        /* デバッグ: rumble raw data */
-        static int rumble_log_count = 0;
-        if (rumble_log_count < 10) {
-            fprintf(stderr, "[btkeyLib] RUMBLE: %02x %02x %02x %02x | %02x %02x %02x %02x (size=%d)\n",
-                    report[1], report[2], report[3], report[4],
-                    report[5], report[6], report[7], report[8], report_size);
-            rumble_log_count++;
-        }
         /* Left motor: high-band amp (byte 1 bit 1-7) と low-band amp (byte 3 bit 1-7) の max
          * 各 7bit (0-127) を 0-255 にスケール (x2) */
         uint8_t l_hi = (report[1] >> 1) & 0x7F;
@@ -1485,16 +1470,9 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                     case HID_SUBEVENT_CAN_SEND_NOW:
                     {
                         static int csn_log_count = 0;
-                        static int csn_state0_count = 0;
                         if (csn_log_count < 5) {
-                            fprintf(stderr, "[btkeyLib] CAN_SEND_NOW: pairing_state=%d hid_cid=%d paired=%d btn=0x%06x\n",
-                                    pairing_state, hid_cid, paired, button_flg);
+                            fprintf(stderr, "[btkeyLib] CAN_SEND_NOW: pairing_state=%d hid_cid=%d\n", pairing_state, hid_cid);
                             csn_log_count++;
-                        }
-                        /* state 0 で入力レポートを送り始めた瞬間を記録 */
-                        if (pairing_state == 0 && !use_3f_report && csn_state0_count == 0) {
-                            fprintf(stderr, "[btkeyLib] CAN_SEND_NOW: now sending 0x30 input reports\n");
-                            csn_state0_count = 1;
                         }
                     }
                     {
@@ -1650,8 +1628,6 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                         if (isop == false)
                         {
                             buffer[2] = ++tim;
-                            fprintf(stderr, "[btkeyLib] SEND_REPLY: pairing_state=%d report_id=0x%02x subcmd=0x%02x\n",
-                                    pairing_state, buffer[1], (sizeof(buffer) > 14) ? buffer[14] : 0);
                             hid_device_send_interrupt_message(hid_cid, buffer, sizeof(buffer));
                         }
                         //printf("pairing_state:%d\n", pairing_state);
