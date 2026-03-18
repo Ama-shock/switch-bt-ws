@@ -230,7 +230,13 @@ int export_link_keys(uint8_t *buf, int buf_size)
         offset += 23;
     }
     db->iterator_done(&it);
-    fprintf(stderr, "[btstack] export_link_keys: %d bytes (%d entries)\n", offset, offset / 23);
+    fprintf(stderr, "[btstack] export_link_keys: %d bytes (%d entries)", offset, offset / 23);
+    /* hex dump of first key for debugging */
+    if (offset >= 23) {
+        fprintf(stderr, " key=");
+        for (int j = 6; j < 22; j++) fprintf(stderr, "%02x", buf[j]);
+    }
+    fprintf(stderr, "\n");
     return offset;
 }
 
@@ -249,8 +255,10 @@ void import_link_keys(const uint8_t *buf, int len)
         memcpy(key, buf + i + 6, 16);
         link_key_type_t type = (link_key_type_t)buf[i + 22];
         db->put_link_key(addr, key, type);
-        fprintf(stderr, "[btstack] import_link_key: addr=%02x:%02x:%02x:%02x:%02x:%02x type=%d\n",
+        fprintf(stderr, "[btstack] import_link_key: addr=%02x:%02x:%02x:%02x:%02x:%02x type=%d key=",
                 addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], type);
+        for (int j = 0; j < 16; j++) fprintf(stderr, "%02x", key[j]);
+        fprintf(stderr, "\n");
         count++;
     }
     fprintf(stderr, "[btstack] imported %d link key(s)\n", count);

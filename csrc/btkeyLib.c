@@ -468,13 +468,84 @@ double send_delay = 1.0/60;
 static btstack_context_callback_registration_t reconnect_callback_reg;
 static btstack_context_callback_registration_t sync_callback_reg;
 
-/* 能動的再接続用: HCI_STATE_WORKING 後に hid_device_connect() を呼ぶためのフラグ */
+/*
+ * HCI OFF→ON サイクル:
+ * hci_power_control(OFF) は WORKING 状態では非同期 (HALTING ステートに遷移し、
+ * run loop の複数イテレーションを経て OFF になる)。
+ * 同一コールバック内で OFF→ON を呼ぶと、HALTING 中のタイマーが残ったまま
+ * ON が同じタイマーを再登録しようとして btstack_assert(next != timer) が発生する。
+ *
+ * 対策: pending_power_on フラグを立てて OFF のみ呼び、BTSTACK_EVENT_STATE で
+ * HCI_STATE_OFF を検出してから ON を呼ぶ。
+ */
+static bool pending_power_on = false;
+
+/* 能動的再接続用 */
 static bool pending_active_connect = false;
 static bd_addr_t reconnect_target_addr;
 
+/*
+ * 0x3F レポート送信フラグ:
+ * active connect 後、Switch が subcmd ハンドシェイクを開始するまで
+ * 0x3F（簡易ボタンレポート）を送信する。実機 Pro Controller は
+ * reconnect 時にまず 0x3F を送り、Switch がこれを検出して subcmd を開始する。
+ * subcmd を受信したら通常の 0x30 レポート + ハンドシェイク応答に切り替える。
+ */
+static bool use_3f_report = false;
+
+/*
+ * 0x81 レポート: Pro Controller の BT 初期化シーケンス。
+ * 実機は reconnect 時にこれを送り、Switch がコントローラーを認識する。
+ * HID ディスクリプタにないカスタムレポート。
+ */
+static int reconnect_init_phase = 0; /* 0=0x81 0x01, 1=0x81 0x02, 2+=0x3F */
+
+static void send_report_3f(void) {
+    if (reconnect_init_phase == 0) {
+        /* Phase 0: 0x81 0x01 — デバイス情報（MAC, firmware等） */
+        bd_addr_t local_addr;
+        gap_local_bd_addr(local_addr);
+        uint8_t report[] = {
+            0xa1, 0x81, 0x01, 0x00, 0x03,  /* report id=0x81, subcmd=0x01, padding, type=Pro Controller */
+            local_addr[0], local_addr[1], local_addr[2],
+            local_addr[3], local_addr[4], local_addr[5],
+        };
+        fprintf(stderr, "[btkeyLib] send 0x81 0x01 (device info)\n");
+        hid_device_send_interrupt_message(hid_cid, report, sizeof(report));
+        reconnect_init_phase = 1;
+        return;
+    }
+    if (reconnect_init_phase == 1) {
+        /* Phase 1: 0x81 0x02 — ハンドシェイク */
+        uint8_t report[] = { 0xa1, 0x81, 0x02 };
+        fprintf(stderr, "[btkeyLib] send 0x81 0x02 (handshake)\n");
+        hid_device_send_interrupt_message(hid_cid, report, sizeof(report));
+        reconnect_init_phase = 2;
+        return;
+    }
+    /* Phase 2+: 0x3F — 簡易ボタンレポート */
+    uint8_t report[13];
+    report[0] = 0xa1;
+    report[1] = 0x3F;
+    report[2] = 0x00;
+    report[3] = 0x00;
+    report[4] = 0x08;
+    report[5]  = 0x00; report[6]  = 0x80;
+    report[7]  = 0x00; report[8]  = 0x80;
+    report[9]  = 0x00; report[10] = 0x80;
+    report[11] = 0x00; report[12] = 0x80;
+    hid_device_send_interrupt_message(hid_cid, report, sizeof(report));
+}
+
+/* HCI OFF してから、イベント駆動で ON する共通ヘルパー */
+static void hci_power_cycle(void) {
+    pending_power_on = true;
+    hci_power_control(HCI_POWER_OFF);
+    fprintf(stderr, "[btkeyLib] hci_power_cycle: OFF requested, pending_power_on=true\n");
+}
+
 static void do_reconnect_on_main(void * context) {
     (void)context;
-    /* リンクキー DB から接続先 BD_ADDR を取得 */
     const btstack_link_key_db_t *db = btstack_link_key_db_memory_instance();
     btstack_link_key_iterator_t it;
     bd_addr_t target_addr;
@@ -488,18 +559,20 @@ static void do_reconnect_on_main(void * context) {
         db->iterator_done(&it);
     }
     if (found) {
-        fprintf(stderr, "[btkeyLib] do_reconnect: target=%s (active connect after HCI cycle)\n", bd_addr_to_str(target_addr));
+        fprintf(stderr, "[btkeyLib] do_reconnect: target=%s (active connect)\n", bd_addr_to_str(target_addr));
         memcpy(reconnect_target_addr, target_addr, 6);
         pending_active_connect = true;
     } else {
-        fprintf(stderr, "[btkeyLib] do_reconnect: no link keys, falling back to discoverable\n");
+        fprintf(stderr, "[btkeyLib] do_reconnect: no link keys, discoverable only\n");
         pending_active_connect = false;
     }
+    use_3f_report = false;
+    reconnect_init_phase = 0;
     paired = false;
     hid_cid = 0;
     pairing_state = 0; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d\n", pairing_state);
-    hci_power_control(HCI_POWER_OFF);
-    hci_power_control(HCI_POWER_ON);
+    hci_power_cycle();
+    reconnect_callback_reg.callback = NULL; /* 再キュー可能にする */
 }
 
 static void do_sync_on_main(void * context) {
@@ -509,10 +582,9 @@ static void do_sync_on_main(void * context) {
     hid_cid = 0;
     pairing_state = 0; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d\n", pairing_state);
     gap_delete_all_link_keys();
-    hci_power_control(HCI_POWER_OFF);
-    hci_power_control(HCI_POWER_ON);
-    /* switch-bt-ws patch: sync 後に明示的に discoverable + connectable 再設定 */
-    fprintf(stderr, "[btkeyLib] do_sync: HCI OFF->ON queued, waiting for HCI_STATE_WORKING...\n");
+    hci_power_cycle();
+    fprintf(stderr, "[btkeyLib] do_sync: HCI OFF requested, ON deferred to HCI_STATE_OFF event\n");
+    sync_callback_reg.callback = NULL; /* 再キュー可能にする */
 }
 
 //----------------------------------------------------------
@@ -522,6 +594,10 @@ static void do_sync_on_main(void * context) {
 //----------------------------------------------------------
 void EXPORT_API reconnect_gamepad()
 {
+    if (reconnect_callback_reg.callback) {
+        fprintf(stderr, "[btkeyLib] reconnect_gamepad: already queued, skip\n");
+        return;
+    }
     fprintf(stderr, "[btkeyLib] reconnect_gamepad: queuing on main thread\n");
     reconnect_callback_reg.callback = &do_reconnect_on_main;
     btstack_run_loop_execute_on_main_thread(&reconnect_callback_reg);
@@ -534,6 +610,10 @@ void EXPORT_API reconnect_gamepad()
 //----------------------------------------------------------
 void EXPORT_API sync_gamepad()
 {
+    if (sync_callback_reg.callback) {
+        fprintf(stderr, "[btkeyLib] sync_gamepad: already queued, skip\n");
+        return;
+    }
     fprintf(stderr, "[btkeyLib] sync_gamepad: queuing on main thread\n");
     sync_callback_reg.callback = &do_sync_on_main;
     btstack_run_loop_execute_on_main_thread(&sync_callback_reg);
@@ -548,10 +628,15 @@ static void do_disconnect_on_main(void * context) {
     } else {
         fprintf(stderr, "[btkeyLib] do_disconnect: not connected\n");
     }
+    disconnect_callback_reg.callback = NULL; /* 再キュー可能にする */
 }
 
 void EXPORT_API disconnect_gamepad()
 {
+    if (disconnect_callback_reg.callback) {
+        fprintf(stderr, "[btkeyLib] disconnect_gamepad: already queued, skip\n");
+        return;
+    }
     fprintf(stderr, "[btkeyLib] disconnect_gamepad: queuing on main thread\n");
     disconnect_callback_reg.callback = &do_disconnect_on_main;
     btstack_run_loop_execute_on_main_thread(&disconnect_callback_reg);
@@ -991,6 +1076,13 @@ static void hid_report_data_callback(uint16_t cid, hid_report_type_t report_type
 
     tim = report[0];
 
+    /* subcmd 受信 → 0x3F レポートから 0x30 + ハンドシェイクに切り替え */
+    if (use_3f_report) {
+        use_3f_report = false;
+        reconnect_init_phase = 0;
+        fprintf(stderr, "[btkeyLib] subcmd received, switching from 0x3F to 0x30 reports\n");
+    }
+
     if (report[9] == 1) {
         switch (report[10]) {
             case 1:
@@ -1229,8 +1321,10 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                 hci_event_link_key_request_get_bd_addr(packet, lk_addr);
                 memcpy(lk_key, &packet[8], 16);
                 link_key_type_t lk_type = (link_key_type_t)packet[24];
-                fprintf(stderr, "[btkeyLib] LINK_KEY_NOTIFICATION: addr=%s type=%d\n",
+                fprintf(stderr, "[btkeyLib] LINK_KEY_NOTIFICATION: addr=%s type=%d key=",
                         bd_addr_to_str(lk_addr), lk_type);
+                for (int i = 0; i < 16; i++) fprintf(stderr, "%02x", lk_key[i]);
+                fprintf(stderr, "\n");
                 /* BTStack の bonding ロジックをバイパスして直接 DB に格納 */
                 const btstack_link_key_db_t *lk_db = btstack_link_key_db_memory_instance();
                 if (lk_db && lk_db->put_link_key) {
@@ -1261,7 +1355,15 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
             }
             case BTSTACK_EVENT_STATE:
             {
-                if (btstack_event_state_get_state(packet) != HCI_STATE_WORKING) return;
+                uint8_t hci_state = btstack_event_state_get_state(packet);
+                /* HCI OFF 完了 → pending_power_on があれば ON を呼ぶ */
+                if (hci_state == HCI_STATE_OFF && pending_power_on) {
+                    pending_power_on = false;
+                    fprintf(stderr, "[btkeyLib] HCI_STATE_OFF: calling HCI_POWER_ON (deferred)\n");
+                    hci_power_control(HCI_POWER_ON);
+                    return;
+                }
+                if (hci_state != HCI_STATE_WORKING) return;
                 /* switch-bt-ws patch: HCI 再起動後も discoverable + connectable に */
                 gap_discoverable_control(1);
                 gap_connectable_control(1);
@@ -1284,9 +1386,11 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                     int wk_len = export_link_keys(wk_buf, sizeof(wk_buf));
                     fprintf(stderr, "[btkeyLib] HCI_STATE_WORKING: link key DB has %d entries\n", wk_len / 23);
                 }
-                /* switch-bt-ws patch: 能動的再接続 — リンクキーがあれば Switch に接続を開始 */
+                /* switch-bt-ws patch: active connect で reconnect */
                 if (pending_active_connect) {
                     pending_active_connect = false;
+                    use_3f_report = false; /* 通常の 0x30 レポートで reconnect */
+                    reconnect_init_phase = 0;
                     uint16_t new_hid_cid = 0;
                     uint8_t status = hid_device_connect(reconnect_target_addr, &new_hid_cid);
                     fprintf(stderr, "[btkeyLib] hid_device_connect(%s): status=0x%02x hid_cid=%d\n",
@@ -1309,20 +1413,25 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                             fprintf(stderr, "[btkeyLib] HID_CONNECTION_OPENED_FAILED: status=%d (0x%02x)\n", status, status);
                             /* switch-bt-ws patch: リンクキー不一致/認証失敗時の自動リカバリ */
                             /* 0x6A=baseband disconnect, 0x66=security refused */
-                            if (status == 0x6A || status == 0x66) {
+                            if (status == 0x05 || status == 0x06 || status == 0x0E) {
+                                /* HCI auth failure / PIN missing / security rejection → リンクキー無効 */
                                 fprintf(stderr, "[btkeyLib] auth failure (0x%02x) → delete link keys + re-sync\n", status);
                                 gap_delete_all_link_keys();
                                 hid_cid = 0;
+                                paired = false;
                                 pairing_state = 0; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d\n", pairing_state);
                                 pending_active_connect = false;
-                                hci_power_control(HCI_POWER_OFF);
-                                hci_power_control(HCI_POWER_ON);
+                                hci_power_cycle();
+                            } else {
+                                /* 0x6A 等: Switch が HID 接続を拒否 (ホーム画面等) → リンクキーは保持 */
+                                fprintf(stderr, "[btkeyLib] HID rejected (0x%02x) → keeping link keys, staying connectable\n", status);
                             }
                             hid_cid = 0;
                             return;
                         }
                         hid_cid = hid_subevent_connection_opened_get_hid_cid(packet);
-                        fprintf(stderr, "[btkeyLib] HID_CONNECTION_OPENED: hid_cid=%d\n", hid_cid);
+                        paired = true;  /* reconnect でもペアリング状態を設定 */
+                        fprintf(stderr, "[btkeyLib] HID_CONNECTION_OPENED: hid_cid=%d paired=true\n", hid_cid);
 
                         hid_device_request_can_send_now_event(hid_cid);
                         break;
@@ -1332,7 +1441,9 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                         fprintf(stderr, "[btkeyLib] HID_CONNECTION_CLOSED\n");
                         hid_cid = 0;
                         pairing_state = 0; fprintf(stderr, "[btkeyLib] PAIRING_STATE_CHANGE: -> %d\n", pairing_state);
-                        paired = false;  /* switch-bt-ws patch: reset paired on close */
+                        paired = false;
+                        use_3f_report = false;
+                        reconnect_init_phase = 0;
                         break;
                     }
                     case HID_SUBEVENT_CAN_SEND_NOW:
@@ -1349,7 +1460,11 @@ static void nintendo_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                         //joy.timer = tim+1;
                         if (pairing_state == 0)
                         {
-                            send_report_joystick();
+                            if (use_3f_report) {
+                                send_report_3f();
+                            } else {
+                                send_report_joystick();
+                            }
                             isop = true;
                         }
                         else if (pairing_state == 16)

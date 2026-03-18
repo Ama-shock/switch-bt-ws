@@ -69,6 +69,15 @@ awk '
     next
 }
 
+# --- パッチ 1b-pre: while ループ直前にマッチカウンター宣言を挿入 ---
+# (HCI OFF→ON で usb_open() が再呼び出しされた時にカウンターが 0 から始まるようにする)
+/while\(GetLastError\(\) != ERROR_NO_MORE_ITEMS\)/ && !patched_counter {
+    print "\tint usb_vid_pid_match_count = 0; /* switch-bt-ws patch: per-call match counter */"
+    print $0
+    patched_counter = 1
+    next
+}
+
 # --- パッチ 1b: "// try all devices" から HeapFree の直前までを置換 ---
 /\/\/ try all devices/ && !patched_open {
     skip_open = 1
@@ -91,19 +100,18 @@ skip_open && /HeapFree/ {
     print "                    HANDLE hProbe = CreateFileA(DevIntfDetailData->DevicePath,"
     print "                        GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,"
     print "                        NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);"
+    print "                    fprintf(stderr, \"[usb_open] VID/PID match #%d: %s\\n\","
+    print "                            usb_vid_pid_match_count, DevIntfDetailData->DevicePath);"
     print "                    if (hProbe != INVALID_HANDLE_VALUE) {"
     print "                        CloseHandle(hProbe);"
-    print "                        static int opened_count = 0;"
-    print "                        fprintf(stderr, \"[usb_open] VID/PID match #%d: %s\\n\","
-    print "                                opened_count, DevIntfDetailData->DevicePath);"
-    print "                        if (opened_count == usb_target_instance) {"
+    print "                        if (usb_vid_pid_match_count == usb_target_instance) {"
     print "                            do_try = 1;"
     print "                        }"
-    print "                        opened_count++;"
     print "                    } else {"
-    print "                        fprintf(stderr, \"[usb_open] VID/PID match but open failed (err=%lu), skipping: %s\\n\","
-    print "                                GetLastError(), DevIntfDetailData->DevicePath);"
+    print "                        fprintf(stderr, \"[usb_open] VID/PID match #%d probe failed (err=%lu), skipping\\n\","
+    print "                                usb_vid_pid_match_count, GetLastError());"
     print "                    }"
+    print "                    usb_vid_pid_match_count++; /* プローブ結果に関わらずカウント */"
     print "                }"
     print "            }"
     print "            BOOL result = FALSE;"
@@ -153,5 +161,17 @@ awk '
 
 mv "${USB_H}.tmp" "$USB_H"
 echo "[patch] hci_transport_usb.h: 完了"
+
+# ---------------------------------------------------------------------------
+# パッチ 3: hid_device.c の L2CAP MTU を 48 → l2cap_max_mtu() に変更
+# ---------------------------------------------------------------------------
+HID_DEVICE_C="${BTSTACK_ROOT}/src/classic/hid_device.c"
+if [ -f "$HID_DEVICE_C" ]; then
+    backup "$HID_DEVICE_C"
+    echo "[patch] hid_device.c にパッチを適用中 ..."
+    sed -i 's/l2cap_create_channel(packet_handler, device->bd_addr, PSM_HID_INTERRUPT, 48,/l2cap_create_channel(packet_handler, device->bd_addr, PSM_HID_INTERRUPT, l2cap_max_mtu(),/' "$HID_DEVICE_C"
+    sed -i 's/l2cap_create_channel(packet_handler, hid_device->bd_addr, PSM_HID_CONTROL, 48,/l2cap_create_channel(packet_handler, hid_device->bd_addr, PSM_HID_CONTROL, l2cap_max_mtu(),/' "$HID_DEVICE_C"
+    echo "[patch] hid_device.c: 完了"
+fi
 
 echo "[patch] 全パッチの適用が完了しました。"

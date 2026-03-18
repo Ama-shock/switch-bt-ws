@@ -8,6 +8,9 @@ cd /app
 cd /btstack/windows && git checkout -- . && cd /app
 bash patches/apply_patches.sh /btstack/windows
 
+# パッチ適用後に build.rs を touch して C ファイルの再コンパイルを強制
+touch build.rs
+
 # サードパーティライセンス生成
 bash scripts/gen_licenses.sh > csrc/THIRD_PARTY_LICENSES.txt
 
