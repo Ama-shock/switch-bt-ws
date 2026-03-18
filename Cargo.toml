@@ -1,6 +1,6 @@
 [package]
 name = "switch-bt-ws"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Nintendo Switch Pro Controller emulator via Bluetooth, controlled over WebSocket"
 
